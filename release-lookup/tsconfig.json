@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "incremental": false
+  },
+  "include": [
+    "release-tool.ts",
+    "release-tool.test.ts"
+  ],
+  "references": [
+    {
+      "path": "../../vendor/cordis"
+    },
+    {
+      "path": "../../vendor/cosmokit"
+    },
+    {
+      "path": "../../vendor/schemastery"
+    }
+  ]
+}
