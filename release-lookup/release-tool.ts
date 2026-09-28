@@ -52,7 +52,8 @@ export function apply(ctx: Context, config: Config) {
       const service = args.service.trim()
       if (!service) throw new Error('service must not be blank')
       const raw: unknown = JSON.parse(await readFile(config.recordsPath, { encoding: 'utf8', signal: exec.signal }))
-      validateJsonSchemaValue(valueSchemaSpecToJsonSchema(recordsSchema), raw)
+      const violations = validateJsonSchemaValue(valueSchemaSpecToJsonSchema(recordsSchema), raw)
+      if (violations.length) throw new Error(`Invalid records file: ${violations.join('; ')}`)
       const records = raw as InferValue<typeof recordsSchema>
       for (const record of records) {
         if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(record.deployedAt) || !Number.isFinite(Date.parse(record.deployedAt)) || new Date(record.deployedAt).toISOString() !== record.deployedAt.replace('Z', '.000Z')) {

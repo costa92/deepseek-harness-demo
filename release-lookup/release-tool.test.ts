@@ -74,6 +74,16 @@ test('file failures are errors, never not_found', async t => {
   assert.equal((await call({ service: 'payment-api', environment: 'production' })).isError, true)
 })
 
+test('a malformed record fails even when it is not in the result', async t => {
+  const { recordsPath, call } = await setup(t)
+  const records = JSON.parse(fixture)
+  records.push({ ...records[0], service: 'other-api', status: 'rolled-back' })
+  await writeFile(recordsPath, JSON.stringify(records))
+  const result = await call({ service: 'payment-api', environment: 'production' })
+  assert.equal(result.isError, true)
+  assert.match(JSON.stringify(result.content), /status/)
+})
+
 test('a changed dataset is read on the next invocation', async t => {
   const { recordsPath, call } = await setup(t)
   await writeFile(recordsPath, '[]')
