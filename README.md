@@ -79,7 +79,7 @@ pnpm dsh --profile web --patch ./scratch-plugin/release-lookup/cordis.generated.
 
 - `release-lookup/release-tool.ts`：工具注册、参数和数据校验、环境过滤、时间排序。
 - `release-lookup/releases.json`：虚构发布记录，不代表实际部署状态。
-- `release-lookup/release-tool.test.ts`：11 项运行时测试。
+- `release-lookup/release-tool.test.ts`：12 项运行时测试。
 - `release-lookup/configure.mjs`：生成本机 Cordis patch。
 - [案例说明](release-lookup/README.md)：环境前提、查询示例及结果解释。
 
