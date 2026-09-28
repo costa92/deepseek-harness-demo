@@ -16,6 +16,8 @@ cp -R scratch-plugin/deepseek-harness-demo/jobs-schedule-demo scratch-plugin/job
 node --import tsx/esm scratch-plugin/jobs-schedule-demo/jobs-schedule-demo.ts
 ```
 
+文章发布时的代码保留在 `dsh-jobs-schedule` 分支，与 `master` 上的本目录相同（仅本句为 master 所加）。
+
 模型是脚本化的，不需要 API key，也不调用真实模型。发布平台和冒烟检查是合成的，检查用定时器模拟。提醒用真实时钟（最短 1 秒），输出里的时间戳替换成了 `<UTC>`。会话日志写在系统临时目录，脚本退出时删除。本机为 Linux，其他平台未验证。
 脚本每一步都带断言，行为与文章不符时以非零退出码结束，一次运行约 8 秒，大部分时间在等提醒到期。
 
