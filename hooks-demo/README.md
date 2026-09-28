@@ -18,6 +18,8 @@ cp -R scratch-plugin/deepseek-harness-demo/hooks-demo scratch-plugin/hooks-demo
 node --import tsx/esm scratch-plugin/hooks-demo/hooks-demo.ts
 ```
 
+文章发布时的代码保留在 `dsh-hooks` 分支，与 `master` 上的本目录相同（仅本句为 master 所加）。
+
 模型和审批人都是脚本化的，不需要 API key，也不调用真实模型。发布平台是本地注册的合成工具，时钟固定。hook 由 dsh 的 bash 执行器以 `node` 启动，需要 `node` 在 `PATH` 里；hooks.json 和账本写在系统临时目录，脚本退出时删除。脚本进程会设置一个假的 `RELEASE_API_TOKEN` 环境变量，用来观察它是否传给 hook。本机为 Linux，其他平台未验证。
 脚本每一步都带断言，行为与文章不符时以非零退出码结束，一次运行约 7 秒。
 
