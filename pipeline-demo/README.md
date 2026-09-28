@@ -14,12 +14,12 @@ post-execute 替换的值会按 output schema 再校验；监听器抛错时调�
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-pipeline https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/pipeline-demo scratch-plugin/pipeline-demo
 node --import tsx/esm scratch-plugin/pipeline-demo/pipeline-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-pipeline` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-pipeline` 分支，与 `master` 上的本目录相同。
 
 脚本里的 `lookup_release` 是简化版（`service` 可选、数据在内存中），不是 `release-lookup/` 下的正式插件。
 不启动 agent 循环，也不调用模型；第 5 步的耗时以约数输出，个别机器上可能有 10ms 级别的偏差。

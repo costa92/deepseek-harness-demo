@@ -13,12 +13,12 @@ Ralph 固定循环每轮一个全新 worker、只交接上一轮报告，证据�
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-workflow https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/workflow-demo scratch-plugin/workflow-demo
 node --import tsx/esm scratch-plugin/workflow-demo/workflow-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-workflow` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-workflow` 分支，与 `master` 上的本目录相同。
 
 模型是按会话分派动作的假适配器，不需要 API key，也不调用真实模型；Ralph worker 的报告和发布数据都是预先写好的合成数据。
 workflow 脚本真的在 PTC 起的 Node 进程里执行，沙箱策略为 `workspace-write`，工作区是系统临时目录，进程退出时删除。本机为 Linux，其他平台未验证。

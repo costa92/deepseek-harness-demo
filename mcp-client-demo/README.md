@@ -13,12 +13,12 @@
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-mcp-client https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/mcp-client-demo scratch-plugin/mcp-client-demo
 node --import tsx/esm scratch-plugin/mcp-client-demo/mcp-client-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-mcp-client` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-mcp-client` 分支，与 `master` 上的本目录相同。
 
 模型和审批人都是脚本化的，不需要 API key，也不调用真实模型。发布平台是合成的，时钟固定。MCP 服务器由 dsh 以当前 Node 可执行文件启动为子进程；账本写在系统临时目录，脚本退出时删除。脚本进程会设置一个假的 `RELEASE_API_TOKEN` 环境变量，用来观察它是否传给服务器。重连策略缩短了延迟。本机为 Linux，其他平台未验证。
 脚本每一步都带断言，行为与文章不符时以非零退出码结束，一次运行约 1 秒。

@@ -13,12 +13,12 @@
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-code-mode https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/code-mode-demo scratch-plugin/code-mode-demo
 node --import tsx/esm scratch-plugin/code-mode-demo/code-mode-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-code-mode` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-code-mode` 分支，与 `master` 上的本目录相同。
 
 模型和审批人都是脚本化的：模型每一步写什么程序是预先写好的，不需要 API key，也不调用真实模型；审批人按设定的延迟批准。发布平台是合成的，时钟固定。
 程序在全新的 Node 子进程里执行，受本地沙箱（`workspace-write`）约束。会话日志写在系统临时目录，脚本退出时删除。本机为 Linux，其他平台未验证。

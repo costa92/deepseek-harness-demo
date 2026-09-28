@@ -15,12 +15,12 @@ token，搜“回滚”找不到，`filterEvents()` 的子串扫描能找到；�
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-session-query https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/session-query-demo scratch-plugin/session-query-demo
 node --import tsx/esm scratch-plugin/session-query-demo/session-query-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-session-query` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-session-query` 分支，与 `master` 上的本目录相同。
 
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型；会话内容是合成的演示数据。
 全文搜索插件直接挂载并使用插件默认的 `openAt: startup`，base bundle 默认关闭全文搜索。

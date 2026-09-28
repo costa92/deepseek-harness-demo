@@ -14,12 +14,12 @@
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-sandbox https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/sandbox-demo scratch-plugin/sandbox-demo
 node --import tsx/esm scratch-plugin/sandbox-demo/sandbox-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-sandbox` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-sandbox` 分支，与 `master` 上的本目录相同。
 
 脚本在 HOME 下建两个临时目录（工作区和"工作区外"），退出时删除；`deploy.env` 里是伪造的 token。
 第 5 步需要系统装有 `zh_CN.UTF-8` locale，没装时打印提示并跳过中文对照。脚本每一步都带断言，

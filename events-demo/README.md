@@ -12,12 +12,12 @@ bail 的中止判定、emit 吞返回值、parallel 聚合错误、serial 串行
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b cordis-events https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/events-demo scratch-plugin/events-demo
 node --import tsx/esm scratch-plugin/events-demo/events-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b cordis-events` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `cordis-events` 分支，与 `master` 上的本目录相同。
 
 脚本只使用 vendor 里的 Cordis，不启动 dsh 进程，也不调用模型；发布数据与 token 均为合成演示数据。
 

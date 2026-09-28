@@ -15,12 +15,12 @@ fork 子 agent 看得到之前的轮次、看不到当前这一轮；父 agent �
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-subagent https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/subagent-demo scratch-plugin/subagent-demo
 node --import tsx/esm scratch-plugin/subagent-demo/subagent-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-subagent` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-subagent` 分支，与 `master` 上的本目录相同。
 
 模型是按会话分派动作的假适配器，不需要 API key，也不调用真实模型；发布数据是合成的。
 preset 目录、会话日志和查询库写在系统临时目录下，进程退出时删除。

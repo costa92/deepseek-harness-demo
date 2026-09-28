@@ -14,12 +14,12 @@
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-tools https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/tools-demo scratch-plugin/tools-demo
 node --import tsx/esm scratch-plugin/tools-demo/tools-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-tools` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-tools` 分支，与 `master` 上的本目录相同。
 
 脚本挂载真实的 dsh 包，直接调用 `ctx.tools.execute()`，不启动 agent 循环，也不调用模型。
 文件写入发生在系统临时目录，运行结束后删除；发布记录为合成演示数据。

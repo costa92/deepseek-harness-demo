@@ -11,12 +11,12 @@
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b cordis-service https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/service-demo scratch-plugin/service-demo
 node --import tsx/esm scratch-plugin/service-demo/service-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b cordis-service` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `cordis-service` 分支，与 `master` 上的本目录相同。
 
 脚本只使用 vendor 里的 Cordis，不启动 dsh 进程，也不调用模型；发布数据为合成演示数据。
 

@@ -6,12 +6,12 @@
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b cordis-effect https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/effect-demo scratch-plugin/effect-demo
 node --import tsx/esm scratch-plugin/effect-demo/effect-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b cordis-effect` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `cordis-effect` 分支，与 `master` 上的本目录相同。
 
 预期输出：
 

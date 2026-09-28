@@ -13,12 +13,12 @@
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-agent-loop https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/agent-loop-demo scratch-plugin/agent-loop-demo
 node --import tsx/esm scratch-plugin/agent-loop-demo/agent-loop-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-agent-loop` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-agent-loop` 分支，与 `master` 上的本目录相同。
 
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型；没有挂持久化，会话只在内存里，不写任何文件。
 发布数据是合成的。脚本每一步都带断言，行为与文章不符时以非零退出码结束。

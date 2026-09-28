@@ -14,12 +14,12 @@
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-rules https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/rules-demo scratch-plugin/rules-demo
 node --import tsx/esm scratch-plugin/rules-demo/rules-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-rules` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-rules` 分支，与 `master` 上的本目录相同。
 
 模型是按轮次执行预设动作的假适配器，不需要 API key，也不调用真实模型；发布平台、它的数据和时钟都是合成的。
 规则引擎的历史只在内存里，引擎重载或进程退出即清零。

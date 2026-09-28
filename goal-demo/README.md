@@ -13,12 +13,12 @@
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-goal https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/goal-demo scratch-plugin/goal-demo
 node --import tsx/esm scratch-plugin/goal-demo/goal-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-goal` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-goal` 分支，与 `master` 上的本目录相同。
 
 模型是脚本里写死每一轮动作的假适配器，不需要 API key，也不调用真实模型；发布数据是合成的。
 会话日志写在系统临时目录下，进程退出时删除。“进程退出”是在同一个 Node 进程里销毁再重建 Context 模拟的，没有真的杀进程。

@@ -13,12 +13,12 @@
 
 ```sh
 mkdir -p scratch-plugin
-git clone -b dsh-spill https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
+git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
 cp -R scratch-plugin/deepseek-harness-demo/spill-demo scratch-plugin/spill-demo
 node --import tsx/esm scratch-plugin/spill-demo/spill-demo.ts
 ```
 
-本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-spill` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+文章发布时的代码保留在 `dsh-spill` 分支，与 `master` 上的本目录相同。
 
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型。spill 策略的上限与 base bundle 相同，
 spill 根目录、会话日志和附件目录都放在系统临时目录下的一个目录里，退出时删除。与 base bundle 的差异：
