@@ -4,7 +4,7 @@ DeepSeek Harness 系列文章的配套示例代码。每篇文章一个目录，
 
 ## 使用方式
 
-示例依赖 DeepSeek Harness 源码工作区，请先准备已安装依赖并完成构建的 DeepSeek Harness 仓库。每个示例目录的 README 都给出从头到尾的完整命令，在 **DeepSeek Harness 仓库根目录** 照做即可：克隆本仓库，把示例目录复制到 `scratch-plugin/` 下（示例按这个目录层级解析依赖），再运行。源码系列（第 4–29 篇）的示例都是这个形式，例如：
+示例依赖 DeepSeek Harness 源码工作区，请先准备已安装依赖并完成构建的 DeepSeek Harness 仓库。每个示例目录的 README 都给出从头到尾的完整命令，在 **DeepSeek Harness 仓库根目录** 照做即可：克隆本仓库，把示例目录复制到 `scratch-plugin/` 下（示例按这个目录层级解析依赖），再运行。源码系列（第 4–30 篇）的示例都是这个形式，例如：
 
 ```sh
 mkdir -p scratch-plugin
@@ -59,6 +59,7 @@ node --import tsx/esm scratch-plugin/mcp-client-demo/mcp-client-demo.ts
 | 27 | [`mcp-client-demo`](mcp-client-demo/) | 发布平台改成 MCP 服务器后，规则引擎认不出部署，dsh 也不校验参数 | `dsh-mcp-client` |
 | 28 | [`hooks-demo`](hooks-demo/) | Claude Code 的 hooks 搬进 dsh，7 种写法拦不住部署 | `dsh-hooks` |
 | 29 | [`jobs-schedule-demo`](jobs-schedule-demo/) | 后台冒烟检查随重启消失，提醒会等到会话恢复 | `dsh-jobs-schedule` |
+| 30 | [`headless-sdk-demo`](headless-sdk-demo/) | 部署被拒退出码仍是 0，SDK 客户端对审批请求只能看不能答 | `dsh-headless-sdk` |
 
 ## release-lookup
 

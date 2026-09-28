@@ -21,6 +21,8 @@ cp -R scratch-plugin/deepseek-harness-demo/headless-sdk-demo scratch-plugin/head
 node --import tsx/esm scratch-plugin/headless-sdk-demo/headless-sdk-demo.ts
 ```
 
+文章发布时的代码保留在 `dsh-headless-sdk` 分支，与 `master` 上的本目录相同（仅本句为 master 所加）。
+
 脚本从源码启动 dsh（`node --import tsx/esm apps/cli/src/bin.ts`），每个子进程用临时的 `DSH_HOME` 和工作目录，脚本退出时删除。模型是脚本化的，不需要 API key，也不调用真实模型；发布平台是合成的。输出里的会话 id 和临时路径替换成了 `session-<uuid>`、`<work>`、`<other>`。本机为 Linux，其他平台未验证。
 脚本每一步都带断言，行为与文章不符时以非零退出码结束，一次运行约 11 秒，大部分时间花在启动 dsh 子进程上。
 
