@@ -17,6 +17,8 @@ cp -R scratch-plugin/deepseek-harness-demo/events-demo scratch-plugin/events-dem
 node --import tsx/esm scratch-plugin/events-demo/events-demo.ts
 ```
 
+本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b cordis-events` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+
 脚本只使用 vendor 里的 Cordis，不启动 dsh 进程，也不调用模型；发布数据与 token 均为合成演示数据。
 
 本机验证环境：DeepSeek Harness `0.1.6-alpha.2`，commit `ddefc45fbc`，vendor Cordis `4.0.2`。

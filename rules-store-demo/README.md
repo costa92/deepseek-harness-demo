@@ -18,6 +18,8 @@ cp -R scratch-plugin/deepseek-harness-demo/rules-store-demo scratch-plugin/rules
 node --import tsx/esm scratch-plugin/rules-store-demo/rules-store-demo.ts
 ```
 
+本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-rules-store` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+
 不需要 API key，也没有模型和 agent 循环；发布平台是合成的。“重启”是在同一个进程里销毁 cordis 根上下文再重建，“两个宿主”是同一进程里的两个根上下文。
 数据写在系统临时目录，脚本退出时删除。本机为 Linux，其他平台未验证。
 zod 是 `dsh-storage-domain` 的依赖，没有装在仓库根，脚本按 pnpm 的安装路径 `packages/storage/storage-domain/node_modules/zod` 引入。

@@ -19,6 +19,8 @@ cp -R scratch-plugin/deepseek-harness-demo/tools-demo scratch-plugin/tools-demo
 node --import tsx/esm scratch-plugin/tools-demo/tools-demo.ts
 ```
 
+本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-tools` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+
 脚本挂载真实的 dsh 包，直接调用 `ctx.tools.execute()`，不启动 agent 循环，也不调用模型。
 文件写入发生在系统临时目录，运行结束后删除；发布记录为合成演示数据。
 

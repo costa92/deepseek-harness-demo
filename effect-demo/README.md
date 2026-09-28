@@ -11,6 +11,8 @@ cp -R scratch-plugin/deepseek-harness-demo/effect-demo scratch-plugin/effect-dem
 node --import tsx/esm scratch-plugin/effect-demo/effect-demo.ts
 ```
 
+本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b cordis-effect` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+
 预期输出：
 
 ```text

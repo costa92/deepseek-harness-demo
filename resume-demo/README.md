@@ -19,6 +19,8 @@ cp -R scratch-plugin/deepseek-harness-demo/resume-demo scratch-plugin/resume-dem
 node --import tsx/esm scratch-plugin/resume-demo/resume-demo.ts
 ```
 
+本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-resume` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型；子进程里的模型每次请求人为延迟
 300ms。脚本会启动子进程并用 `SIGKILL` 结束它们，会话日志写在系统临时目录下，退出时删除。脚本每一步
 都带断言，行为与文章不符时以非零退出码结束。

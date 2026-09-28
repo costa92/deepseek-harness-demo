@@ -18,6 +18,8 @@ cp -R scratch-plugin/deepseek-harness-demo/spill-demo scratch-plugin/spill-demo
 node --import tsx/esm scratch-plugin/spill-demo/spill-demo.ts
 ```
 
+本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-spill` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型。spill 策略的上限与 base bundle 相同，
 spill 根目录、会话日志和附件目录都放在系统临时目录下的一个目录里，退出时删除。与 base bundle 的差异：
 文件系统用 `dsh-fs-local` 而不是 `dsh-fs-sandbox`；“31 天”靠修改文件修改时间模拟，“重启”是在同一进程里销毁并重建 Context。

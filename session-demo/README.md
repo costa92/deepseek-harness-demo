@@ -18,6 +18,8 @@ cp -R scratch-plugin/deepseek-harness-demo/session-demo scratch-plugin/session-d
 node --import tsx/esm scratch-plugin/session-demo/session-demo.ts
 ```
 
+本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-session` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型。会话日志写在系统临时目录下，
 持久化使用 `compression: 'none'` 以便直接阅读，退出时删除。脚本每一步都带断言，行为与文章不符时
 以非零退出码结束。

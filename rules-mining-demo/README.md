@@ -18,6 +18,8 @@ cp -R scratch-plugin/deepseek-harness-demo/rules-mining-demo scratch-plugin/rule
 node --import tsx/esm scratch-plugin/rules-mining-demo/rules-mining-demo.ts
 ```
 
+本目录已合并到仓库的 `master` 分支：上面的命令去掉 `-b dsh-rules-mining` 也能取到同样的代码。原分支保留，与文章里的链接对应。
+
 模型是按轮次执行预设动作的假适配器，不需要 API key，也不调用真实模型；发布平台和时钟是合成的，“三天”是在同一进程里拨时钟。
 会话日志和规则数据写在系统临时目录，脚本退出时删除。本机为 Linux，其他平台未验证。
 zod 是 `dsh-storage-domain` 的依赖，没有装在仓库根，`rule-store.ts` 按 pnpm 的安装路径 `packages/storage/storage-domain/node_modules/zod` 引入。
