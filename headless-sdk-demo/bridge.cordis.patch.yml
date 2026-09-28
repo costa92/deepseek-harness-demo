@@ -1,0 +1,8 @@
+# 在 duty.cordis.patch.yml 之后叠加：给子进程补一个审批应答者，答案来自父进程写的文件。
+- insert:
+    - id: approval-bridge
+      name: './approval-bridge.ts'
+      inject: [approval]
+      config:
+        dir: !!js process.env.DUTY_APPROVAL_DIR
+        timeoutMs: !!js Number(process.env.DUTY_APPROVAL_TIMEOUT_MS ?? 5000)

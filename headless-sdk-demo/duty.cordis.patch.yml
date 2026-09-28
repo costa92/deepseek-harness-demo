@@ -1,0 +1,9 @@
+# 叠在 headless / sdk profile 之上：默认模型换成脚本化的 scripted/mock，挂上值班插件。
+- id: agent-default-model
+  config:
+    provider: scripted
+    model: mock
+
+- insert:
+    - id: duty-demo
+      name: './duty-plugin.ts'

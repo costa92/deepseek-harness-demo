@@ -1,0 +1,19 @@
+# 无人值守的写法：新会话固定到一个“沙箱照旧、审批一律拒绝”的预设。
+# 不用 DSH_PERMISSION_MODE=danger-full-access：它在拒绝审批的同时放开了沙箱。
+# 按 id 打的补丁会整体替换这一行的 config，base 原有的三个预设要照抄一遍。
+- id: permission
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+      ci:
+        sandbox: workspace-write
+        approval: never
+    defaultPreset: ci
