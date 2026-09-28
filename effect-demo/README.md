@@ -1,6 +1,6 @@
 # effect-demo
 
-《DeepSeek Harness 源码：插件卸载后，它注册的东西去哪了》配套脚本。只使用 DeepSeek Harness 内置的 Cordis，演示插件等待依赖、副作用逆序撤销、卸载后禁止注册、依赖消失后退回 PENDING。不启动 dsh，不调用模型。
+配套文章《DeepSeek Harness 源码：插件卸载后，它注册的东西去哪了》（系列第 4 篇）。只使用 DeepSeek Harness 内置的 Cordis，演示插件等待依赖、副作用逆序撤销、卸载后禁止注册、依赖消失后退回 PENDING。不启动 dsh，不调用模型。
 
 在 **DeepSeek Harness 仓库根目录** 执行：
 
@@ -12,6 +12,8 @@ node --import tsx/esm scratch-plugin/effect-demo/effect-demo.ts
 ```
 
 文章发布时的代码保留在 `cordis-effect` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
+
+脚本带断言，行为与文章不符时以非零退出码结束。
 
 预期输出：
 

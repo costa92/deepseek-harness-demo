@@ -21,6 +21,8 @@ node --import tsx/esm scratch-plugin/pipeline-demo/pipeline-demo.ts
 
 文章发布时的代码保留在 `dsh-pipeline` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
+脚本带断言，行为与文章不符时以非零退出码结束。
+
 脚本里的 `lookup_release` 是简化版（`service` 可选、数据在内存中），不是 `release-lookup/` 下的正式插件。
 不启动 agent 循环，也不调用模型；第 5 步的耗时以约数输出，个别机器上可能有 10ms 级别的偏差。
 

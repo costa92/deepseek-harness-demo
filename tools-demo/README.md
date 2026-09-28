@@ -21,6 +21,8 @@ node --import tsx/esm scratch-plugin/tools-demo/tools-demo.ts
 
 文章发布时的代码保留在 `dsh-tools` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
+脚本带断言，行为与文章不符时以非零退出码结束。
+
 脚本挂载真实的 dsh 包，直接调用 `ctx.tools.execute()`，不启动 agent 循环，也不调用模型。
 文件写入发生在系统临时目录，运行结束后删除；发布记录为合成演示数据。
 

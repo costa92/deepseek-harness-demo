@@ -20,6 +20,8 @@ node --import tsx/esm scratch-plugin/tree-demo/tree-demo.ts
 
 文章发布时的代码保留在 `cordis-tree` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
+脚本带断言，行为与文章不符时以非零退出码结束。
+
 脚本只使用 vendor 里的 Cordis，不启动 dsh 进程，也不调用模型；配置内容为合成演示数据。
 
 本机验证环境：DeepSeek Harness `0.1.6-alpha.2`，commit `ddefc45fbc`，vendor Cordis `4.0.2`。
