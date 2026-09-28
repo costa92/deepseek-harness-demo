@@ -11,7 +11,7 @@ cp -R scratch-plugin/deepseek-harness-demo/effect-demo scratch-plugin/effect-dem
 node --import tsx/esm scratch-plugin/effect-demo/effect-demo.ts
 ```
 
-文章发布时的代码保留在 `cordis-effect` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `cordis-effect` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 预期输出：
 

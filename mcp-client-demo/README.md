@@ -18,7 +18,7 @@ cp -R scratch-plugin/deepseek-harness-demo/mcp-client-demo scratch-plugin/mcp-cl
 node --import tsx/esm scratch-plugin/mcp-client-demo/mcp-client-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-mcp-client` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `dsh-mcp-client` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 模型和审批人都是脚本化的，不需要 API key，也不调用真实模型。发布平台是合成的，时钟固定。MCP 服务器由 dsh 以当前 Node 可执行文件启动为子进程；账本写在系统临时目录，脚本退出时删除。脚本进程会设置一个假的 `RELEASE_API_TOKEN` 环境变量，用来观察它是否传给服务器。重连策略缩短了延迟。本机为 Linux，其他平台未验证。
 脚本每一步都带断言，行为与文章不符时以非零退出码结束，一次运行约 1 秒。

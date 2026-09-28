@@ -19,7 +19,7 @@ cp -R scratch-plugin/deepseek-harness-demo/rules-review-demo scratch-plugin/rule
 node --import tsx/esm scratch-plugin/rules-review-demo/rules-review-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-rules-review` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `dsh-rules-review` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 模型和审批人都是脚本化的：模型按轮次执行预设动作，不需要 API key，也不调用真实模型；审批人按 `reason` 里有没有误拦决定。发布平台和时钟是合成的，“三天”是在同一进程里拨时钟。
 会话日志和规则数据写在系统临时目录，脚本退出时删除。本机为 Linux，其他平台未验证。

@@ -19,7 +19,7 @@ cp -R scratch-plugin/deepseek-harness-demo/compaction-demo scratch-plugin/compac
 node --import tsx/esm scratch-plugin/compaction-demo/compaction-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-compaction` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `dsh-compaction` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型：上下文窗口人为设为 2000 token，
 摘要是固定文本，超限错误按脚本返回。剪枝阈值按比例缩小（超过 1200 字符才剪，保留头 600、尾 200）。

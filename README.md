@@ -4,25 +4,22 @@ DeepSeek Harness 系列文章的配套示例代码。每篇文章一个目录，
 
 ## 使用方式
 
-示例依赖 DeepSeek Harness 源码工作区，请先准备已安装依赖并完成构建的 DeepSeek Harness 仓库。在 **DeepSeek Harness 仓库根目录** 执行，把本仓库克隆一次，再把要运行的示例目录复制到 `scratch-plugin/` 下（示例按这个目录层级解析依赖）：
+示例依赖 DeepSeek Harness 源码工作区，请先准备已安装依赖并完成构建的 DeepSeek Harness 仓库。每个示例目录的 README 都给出从头到尾的完整命令，在 **DeepSeek Harness 仓库根目录** 照做即可：克隆本仓库，把示例目录复制到 `scratch-plugin/` 下（示例按这个目录层级解析依赖），再运行。源码系列（第 4–27 篇）的示例都是这个形式，例如：
 
 ```sh
 mkdir -p scratch-plugin
 git clone https://github.com/costa92/deepseek-harness-demo.git scratch-plugin/deepseek-harness-demo
-cp -R scratch-plugin/deepseek-harness-demo/<示例目录> scratch-plugin/<示例目录>
+cp -R scratch-plugin/deepseek-harness-demo/mcp-client-demo scratch-plugin/mcp-client-demo
+node --import tsx/esm scratch-plugin/mcp-client-demo/mcp-client-demo.ts
 ```
 
-之后按该目录 README 里的命令运行。源码系列（第 4–27 篇）的示例都是一条命令：
+已经克隆过本仓库时，跳过 `mkdir` 和 `git clone` 两行，从 `cp -R` 开始；`scratch-plugin/` 下已有同名示例目录时先删除它，否则 `cp -R` 会复制成嵌套的子目录。
 
-```sh
-node --import tsx/esm scratch-plugin/<示例目录>/<示例目录>.ts
-```
-
-它们都不需要 API key，也不调用真实模型：用到模型、审批人和发布平台的地方都是脚本化或合成的。脚本带断言，行为与文章不符时以非零退出码结束。验证环境均为 DeepSeek Harness `0.1.6-alpha.2`，commit `ddefc45fbc`。
+源码系列的示例都不需要 API key，也不调用真实模型：用到模型、审批人和发布平台的地方都是脚本化或合成的。脚本带断言，行为与文章不符时以非零退出码结束。验证环境均为 DeepSeek Harness `0.1.6-alpha.2`，commit `ddefc45fbc`。
 
 ## 目录
 
-`master` 汇总了全部示例，文章里的运行命令和代码链接都指向 `master`。文章发布时每个示例放在单独的分支上，这些分支保留不动，内容与 `master` 上对应目录相同。
+`master` 汇总了全部示例，文章里的代码链接和运行命令都固定到 `master` 上的提交。文章发布时每个示例放在单独的分支上，这些分支保留不动，示例源码与 `master` 上对应目录相同，`master` 上的 README 更新了运行方式。
 
 ### 实战
 

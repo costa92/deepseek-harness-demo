@@ -18,7 +18,7 @@ cp -R scratch-plugin/deepseek-harness-demo/rules-store-demo scratch-plugin/rules
 node --import tsx/esm scratch-plugin/rules-store-demo/rules-store-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-rules-store` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `dsh-rules-store` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 不需要 API key，也没有模型和 agent 循环；发布平台是合成的。“重启”是在同一个进程里销毁 cordis 根上下文再重建，“两个宿主”是同一进程里的两个根上下文。
 数据写在系统临时目录，脚本退出时删除。本机为 Linux，其他平台未验证。

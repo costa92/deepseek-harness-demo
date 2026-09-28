@@ -22,7 +22,7 @@ cp -R scratch-plugin/deepseek-harness-demo/preset-demo scratch-plugin/preset-dem
 node --import tsx/esm scratch-plugin/preset-demo/preset-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-preset` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `dsh-preset` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 preset 目录和 `DSH_HOME` 都建在系统临时目录下，进程退出时删除。`dsh-persona` 按包名从 `apps/cli` 解析，需要该目录的依赖已安装。
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型；会话只在内存里。脚本每一步都带断言，行为与文章不符时以非零退出码结束。

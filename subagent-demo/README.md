@@ -20,7 +20,7 @@ cp -R scratch-plugin/deepseek-harness-demo/subagent-demo scratch-plugin/subagent
 node --import tsx/esm scratch-plugin/subagent-demo/subagent-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-subagent` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `dsh-subagent` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 模型是按会话分派动作的假适配器，不需要 API key，也不调用真实模型；发布数据是合成的。
 preset 目录、会话日志和查询库写在系统临时目录下，进程退出时删除。

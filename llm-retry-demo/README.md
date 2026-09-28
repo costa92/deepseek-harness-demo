@@ -16,7 +16,7 @@ cp -R scratch-plugin/deepseek-harness-demo/llm-retry-demo scratch-plugin/llm-ret
 node --import tsx/esm scratch-plugin/llm-retry-demo/llm-retry-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-llm-retry` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `dsh-llm-retry` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 模型提供方是脚本化的：每次请求返回什么、抛什么错误是预先写好的，不需要 API key，也不调用真实模型。重试策略由这个假提供方给出（最多 2 次、20 毫秒起步、上限 200 毫秒、不加抖动，只重试 `RATE_LIMIT` 和 `TRANSPORT`），与 dsh 默认值不同。发布平台是合成的，会话只在内存里。本机为 Linux，其他平台未验证。
 脚本每一步都带断言，行为与文章不符时以非零退出码结束，一次运行约 2 秒。

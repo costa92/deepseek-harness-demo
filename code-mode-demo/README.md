@@ -18,7 +18,7 @@ cp -R scratch-plugin/deepseek-harness-demo/code-mode-demo scratch-plugin/code-mo
 node --import tsx/esm scratch-plugin/code-mode-demo/code-mode-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-code-mode` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `dsh-code-mode` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 模型和审批人都是脚本化的：模型每一步写什么程序是预先写好的，不需要 API key，也不调用真实模型；审批人按设定的延迟批准。发布平台是合成的，时钟固定。
 程序在全新的 Node 子进程里执行，受本地沙箱（`workspace-write`）约束。会话日志写在系统临时目录，脚本退出时删除。本机为 Linux，其他平台未验证。

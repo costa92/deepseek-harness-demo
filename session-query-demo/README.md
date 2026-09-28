@@ -20,7 +20,7 @@ cp -R scratch-plugin/deepseek-harness-demo/session-query-demo scratch-plugin/ses
 node --import tsx/esm scratch-plugin/session-query-demo/session-query-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-session-query` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `dsh-session-query` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型；会话内容是合成的演示数据。
 全文搜索插件直接挂载并使用插件默认的 `openAt: startup`，base bundle 默认关闭全文搜索。

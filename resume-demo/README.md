@@ -19,7 +19,7 @@ cp -R scratch-plugin/deepseek-harness-demo/resume-demo scratch-plugin/resume-dem
 node --import tsx/esm scratch-plugin/resume-demo/resume-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-resume` 分支，与 `master` 上的本目录相同。
+文章发布时的代码保留在 `dsh-resume` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
 
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型；子进程里的模型每次请求人为延迟
 300ms。脚本会启动子进程并用 `SIGKILL` 结束它们，会话日志写在系统临时目录下，退出时删除。脚本每一步
