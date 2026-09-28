@@ -1,7 +1,7 @@
 /** Drive the release duty agent from outside the dsh process: headless one-shot runs, then the TypeScript SDK over stdio JSON-RPC. */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DeepSeekHarness, JsonRpcResponseError } from '@deepseek-ai/dsh-sdk-client'
@@ -152,7 +152,7 @@ log('\n== 4. SDK：审批请求传到了客户端，但客户端答不了 ==')
   assert.deepEqual(ledger(), [])
 
   const failed = await sdk.run('模型故障', { sessionId: 'duty-1' })
-  const end = eventsOf(failed).find(e => e.type === 'turn/end')
+  const end = eventsOf(failed).findLast(e => e.type === 'turn/end')
   log('模型故障')
   log(`  run() 正常返回，finalResponse | ${JSON.stringify(failed.finalResponse)}`)
   log(`  turn/end.reason               | ${JSON.stringify(end?.data.reason)}`)
@@ -177,18 +177,15 @@ log('\n== 5. 审批桥：子进程里挂应答者，答案由客户端写文件 
   await using sdk = harness({ bridge: dir })
   // 值班人的规则：2.3 在黑名单里，2.5 不回答（模拟人不在）。
   const reviewer = (args: { version: string }) => args.version === '2.3' ? 'reject' : args.version === '2.5' ? undefined : 'allow'
+  // 参数取自审批之前写入的 tool/call 事件；通知覆盖整棵会话树，键里带上会话。
   const callArgs = new Map<string, { version: string }>()
   const onNotification = (n: HarnessNotification) => {
     const event = eventOf(n)
-    if (event?.type === 'assistant/message') {
-      const content = (event.data.message as { content: { type: string; id?: string; arguments?: string }[] }).content
-      for (const block of content) {
-        if (block.type === 'tool-call') callArgs.set(String(block.id), JSON.parse(String(block.arguments)) as { version: string })
-      }
-    }
+    const key = `${String(n.params.sessionId)}:${String(event?.data.callId)}`
+    if (event?.type === 'tool/call') callArgs.set(key, JSON.parse(String(event.data.arguments)) as { version: string })
     if (event?.type !== 'approval/asked') return
     const callId = String(event.data.callId)
-    const args = callArgs.get(callId)
+    const args = callArgs.get(key)
     assert.ok(args !== undefined, `approval/asked 之前没见到 ${callId} 的参数`)
     const answer = reviewer(args)
     log(`  approval/asked ${callId} | 参数 ${JSON.stringify(args)} → ${answer ?? '不回答'}`)
@@ -210,5 +207,7 @@ log('\n== 5. 审批桥：子进程里挂应答者，答案由客户端写文件 
   assert.deepEqual(outcomes, ['allowed-once', 'rejected', 'unavailable'])
   log(`部署账本：${ledger().join(' ')}`)
   assert.deepEqual(ledger(), ['{"service":"payment-api","version":"2.4"}'])
+  // 应答者读完就删，目录里不留下能被下一次同名调用读到的旧答案。
+  assert.deepEqual(readdirSync(dir), [])
   rmSync(dir, { recursive: true, force: true })
 }
