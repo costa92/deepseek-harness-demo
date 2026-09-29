@@ -1,0 +1,42 @@
+# 照 apps/cli/config/examples/github-review/cordis.yml 的写法：webhook 运行时、值班规则，以及隔离出来的第二个 WebServer。
+# 同一个监听器上挂两条路由：/release 不去重，/release-dedup 由规则按投递 id 去重。
+- insert:
+    - id: webhook-runtime
+      name: '@deepseek-ai/dsh-webhook'
+
+    - id: release-webhook-rule
+      name: './release-webhook-rule.ts'
+      config:
+        sources: [release-platform, release-platform-dedup]
+        dedupeSources: [release-platform-dedup]
+        workspacePath: !!js process.env.DUTY_WORKSPACE
+        agentPreset: standard
+        permissionPreset: read-only
+
+    - id: release-webhook-ingress
+      name: cordis:group
+      group: true
+      isolate:
+        webServer: true
+      config:
+        - id: release-webhook-server
+          name: '@deepseek-ai/dsh-host-webserver'
+          config:
+            host: '127.0.0.1'
+            port: !!js Number(process.env.DUTY_WEBHOOK_PORT)
+
+        - id: release-webhook-adapter
+          name: '@deepseek-ai/dsh-webhook-github'
+          config:
+            source: release-platform
+            path: /release
+            secretEnv: DUTY_WEBHOOK_SECRET
+            maxBodyBytes: 4096
+
+        - id: release-webhook-adapter-dedup
+          name: '@deepseek-ai/dsh-webhook-github'
+          config:
+            source: release-platform-dedup
+            path: /release-dedup
+            secretEnv: DUTY_WEBHOOK_SECRET
+            maxBodyBytes: 4096
