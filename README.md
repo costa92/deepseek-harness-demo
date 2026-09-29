@@ -63,6 +63,7 @@ node --import tsx/esm scratch-plugin/mcp-client-demo/mcp-client-demo.ts
 | 31 | [`webhook-demo`](webhook-demo/) | webhook 同一投递送两遍，建出两个值班会话 | `dsh-webhook` |
 | 32 | [`skills-demo`](skills-demo/) | 仓库里的同名 skill 顶替了值班手册 | `dsh-skills` |
 | 33 | [`guard-demo`](guard-demo/) | 部署超时后模型重试，平台收到三次部署 | `dsh-guard` |
+| 34 | [`instructions-demo`](instructions-demo/) | 仓库的大 AGENTS.md 挤掉值班组全局规则 | `dsh-agent-instructions` |
 
 ## release-lookup
 
