@@ -20,6 +20,8 @@ cp -R scratch-plugin/deepseek-harness-demo/skills-demo scratch-plugin/skills-dem
 node --import tsx/esm scratch-plugin/skills-demo/skills-demo.ts
 ```
 
+文章发布时的代码保留在 `dsh-skills` 分支，与 `master` 上的本目录相同（仅本句为 master 所加）。
+
 模型是脚本化的，不需要 API key，也不调用真实模型。skill 目录、发布仓库和用户目录都建在系统临时目录，脚本退出时删除，输出里的临时路径替换成了 `<tmp>`。脚本会忽略环境变量 `DSH_BUNDLED_SKILL_DIR`。本机为 Linux，其他平台未验证。
 脚本每一步都带断言，行为与文章不符时以非零退出码结束，一次运行约 1 秒。
 

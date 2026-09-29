@@ -61,6 +61,7 @@ node --import tsx/esm scratch-plugin/mcp-client-demo/mcp-client-demo.ts
 | 29 | [`jobs-schedule-demo`](jobs-schedule-demo/) | 后台冒烟检查随重启消失，提醒会等到会话恢复 | `dsh-jobs-schedule` |
 | 30 | [`headless-sdk-demo`](headless-sdk-demo/) | 部署被拒退出码仍是 0，SDK 客户端对审批请求只能看不能答 | `dsh-headless-sdk` |
 | 31 | [`webhook-demo`](webhook-demo/) | webhook 同一投递送两遍，建出两个值班会话 | `dsh-webhook` |
+| 32 | [`skills-demo`](skills-demo/) | 仓库里的同名 skill 顶替了值班手册 | `dsh-skills` |
 
 ## release-lookup
 
