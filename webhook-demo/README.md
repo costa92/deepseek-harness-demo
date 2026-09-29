@@ -21,6 +21,8 @@ cp -R scratch-plugin/deepseek-harness-demo/webhook-demo scratch-plugin/webhook-d
 node --import tsx/esm scratch-plugin/webhook-demo/webhook-demo.ts
 ```
 
+文章发布时的代码保留在 `dsh-webhook` 分支，与 `master` 上的本目录相同（仅本句为 master 所加）。
+
 脚本从源码启动 dsh（`node --import tsx/esm apps/cli/src/bin.ts --profile web`），用临时的 `DSH_HOME`、`DSH_AGENTS_HOME` 和工作目录，两个端口都取本机空闲端口，退出时关掉子进程并删除临时目录。模型是脚本化的，不需要 API key；发布平台和 webhook 密钥都是合成的。本机为 Linux，其他平台未验证。
 脚本每一步都带断言，行为与文章不符时以非零退出码结束，一次运行约 9 秒，大部分时间花在启动 dsh 上。
 
