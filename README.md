@@ -62,6 +62,7 @@ node --import tsx/esm scratch-plugin/mcp-client-demo/mcp-client-demo.ts
 | 30 | [`headless-sdk-demo`](headless-sdk-demo/) | 部署被拒退出码仍是 0，SDK 客户端对审批请求只能看不能答 | `dsh-headless-sdk` |
 | 31 | [`webhook-demo`](webhook-demo/) | webhook 同一投递送两遍，建出两个值班会话 | `dsh-webhook` |
 | 32 | [`skills-demo`](skills-demo/) | 仓库里的同名 skill 顶替了值班手册 | `dsh-skills` |
+| 33 | [`guard-demo`](guard-demo/) | 部署超时后模型重试，平台收到三次部署 | `dsh-guard` |
 
 ## release-lookup
 

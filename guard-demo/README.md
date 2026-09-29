@@ -22,6 +22,8 @@ cp -R scratch-plugin/deepseek-harness-demo/guard-demo scratch-plugin/guard-demo
 node --import tsx/esm scratch-plugin/guard-demo/guard-demo.ts
 ```
 
+文章发布时的代码保留在 `dsh-guard` 分支，与 `master` 上的本目录相同（仅本句为 master 所加）。
+
 模型是脚本化的，不需要 API key，也不调用真实模型。发布平台是合成的，上线用 2.5 秒的定时器模拟，会话只在内存。本机为 Linux，其他平台未验证。
 脚本每一步都带断言，行为与文章不符时以非零退出码结束，一次运行约 14 秒，大部分时间在等定时器。
 
