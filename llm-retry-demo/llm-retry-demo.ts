@@ -1,8 +1,13 @@
 /** Drive a release agent against a flaky scripted model provider: what dsh-llm-retry retries, what the log keeps, and what the meter counts. */
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import LlmRuntime, { LlmAdapter, LlmError, ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, LlmResolvedModelInfo, Message, ResolvedRetryPolicy, StreamChunk } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { LlmAdapter, LlmError, ToolCallId, createUserMessage, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmResolvedModelInfo, Message, ResolvedRetryPolicy, RetryPolicyConfig, StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -11,25 +16,40 @@ import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import * as LlmRetry from '@deepseek-ai/dsh-llm-retry'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
+import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
+import * as DeepSeek from '@deepseek-ai/dsh-llm-deepseek'
 
 const log = (msg: string) => { console.log(msg) }
 
 // ── 脚本化的提供方：每次请求按剧本做一件事 ─────────────────────────────────────
 // text：正常回答；call：调一次 deploy_release；rate：429；rate-late：429 且要求等 60 秒；
-// plain：抛普通 Error；auth：认证失败；cut：调用块和用量都已流出后连接断开。
-type Step = 'text' | 'call' | 'rate' | 'rate-late' | 'plain' | 'auth' | 'cut'
+// plain：抛普通 Error；auth：认证失败；cut：调用块和用量都已流出后连接断开；
+// cut-mid：调用参数流到一半断开；overflow：上下文超长；coded：带 code 属性的普通 Error；
+// carried / mismatch：带 failure 对象的 Error，failure.code 与 code 一致 / 不一致。
+type Step = 'text' | 'call' | 'rate' | 'rate-late' | 'plain' | 'auth' | 'cut' | 'cut-mid' | 'overflow' | 'coded' | 'carried' | 'mismatch'
 const usage = (inputTokens: number, outputTokens: number): StreamChunk => ({ type: 'usage', usage: { inputTokens, outputTokens } })
 class FlakyProvider extends LlmAdapter {
   script: Step[] = []
   readonly requests: Message[][] = []
   onRequest: (n: number) => void = () => undefined
   constructor(private readonly policy?: ResolvedRetryPolicy) { super() }
+  compactions = 0
   // 重试策略归提供方所有，在注册路由时读一次（dsh-llm index.ts:439）。
   override providerRetryPolicy(): ResolvedRetryPolicy | undefined { return this.policy }
   override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
-    return Promise.resolve({ provider, id: model, name: model })
+    return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 1_000_000 } })
   }
   async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    if (options.purpose === 'compaction') {
+      // 压缩插件的摘要请求：直接给一段摘要，不占剧本。
+      this.compactions++
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text: '## 摘要\n- 用户在查发布记录' }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: '## 摘要\n- 用户在查发布记录' } }
+      yield usage(50, 10)
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
     this.requests.push(options.messages)
     this.onRequest(this.requests.length)
     const step = this.script.shift()
@@ -38,6 +58,10 @@ class FlakyProvider extends LlmAdapter {
     if (step === 'rate-late') throw new LlmError('429 retry later', 'RATE_LIMIT', { status: 429, providerRetryAfterMs: 60_000 })
     if (step === 'auth') throw new LlmError('401 invalid api key', 'AUTH', { status: 401 })
     if (step === 'plain') throw new Error('socket hang up')
+    if (step === 'overflow') throw new LlmError('prompt exceeds the context window', 'CONTEXT_WINDOW_EXCEEDED', { status: 400 })
+    if (step === 'coded') throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })
+    if (step === 'carried') throw Object.assign(new Error('socket hang up'), { code: 'TRANSPORT', failure: { message: 'socket hang up', code: 'TRANSPORT' } })
+    if (step === 'mismatch') throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET', failure: { message: 'socket hang up', code: 'TRANSPORT' } })
     if (step === 'text') {
       yield { type: 'block-start', index: 0, blockType: 'text' }
       yield { type: 'text-delta', index: 0, text: '已处理。' }
@@ -49,6 +73,10 @@ class FlakyProvider extends LlmAdapter {
     const id = ToolCallId(`call-${this.requests.length}`)
     const json = JSON.stringify({ service: 'payment-api', version: '2.5' })
     yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+    if (step === 'cut-mid') {
+      yield { type: 'tool-call-delta', index: 0, id, name: 'deploy_release', argumentsDelta: json.slice(0, 20) }
+      throw new LlmError('connection reset', 'TRANSPORT')
+    }
     yield { type: 'tool-call-delta', index: 0, id, name: 'deploy_release', argumentsDelta: json }
     yield { type: 'block-end', index: 0, block: { type: 'tool-call', id, name: 'deploy_release', arguments: json } }
     yield usage(100, 20)
@@ -75,7 +103,8 @@ const deployRelease = defineTool({
 const NORMAL: ResolvedRetryPolicy = { mode: 'normal', maxRetries: 2, retryableCodes: ['RATE_LIMIT', 'TRANSPORT'], initialDelayMs: 20, maxDelayMs: 200, jitterRatio: 0 }
 const ALWAYS: ResolvedRetryPolicy = { mode: 'always', initialDelayMs: 20, maxDelayMs: 200, jitterRatio: 0 }
 interface Host { provider: FlakyProvider; agent: Agent; ctx: Context }
-async function boot(id: string, options: { retry: boolean; policy?: ResolvedRetryPolicy }): Promise<Host> {
+// policy 为 'default' 时适配器不提供策略，走 dsh-llm 的默认值；deepseek 给出时改挂真实的 llm-deepseek 适配器。
+async function boot(id: string, options: { retry: boolean; policy?: ResolvedRetryPolicy | 'default'; compaction?: boolean; deepseek?: string }): Promise<Host> {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
@@ -85,11 +114,15 @@ async function boot(id: string, options: { retry: boolean; policy?: ResolvedRetr
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(TokenMeter)
   if (options.retry) await ctx.plugin(LlmRetry)
+  // 上下文窗口给得很大，按压力的压缩不会触发，只剩上下文超长时的恢复。
+  if (options.compaction === true) await ctx.plugin(BasicCompactionEngine)
   await ctx.plugin(AgentLoop, { agents: [] })
-  const provider = new FlakyProvider(options.policy ?? NORMAL)
-  ctx.llm.registerAdapter(['flaky'], provider)
+  const provider = new FlakyProvider(options.policy === 'default' ? undefined : options.policy ?? NORMAL)
+  if (options.deepseek === undefined) ctx.llm.registerAdapter(['flaky'], provider)
+  else await ctx.plugin(DeepSeek, { baseURL: options.deepseek, apiKeyEnv: 'DSH_DEMO_DEEPSEEK_KEY', retryPolicy: { mode: 'normal', maxRetries: 2, backoff: { initialDelayMs: 20, maxDelayMs: 200, jitterRatio: 0 } } })
   ctx.tools.register(deployRelease)
-  const { agent } = await ctx.agents.create({ sessionId: SessionId(id), agentOptions: { provider: 'flaky', model: 'mock' } })
+  const agentOptions = options.deepseek === undefined ? { provider: 'flaky', model: 'mock' } : { provider: 'deepseek-official', model: 'deepseek-flash' }
+  const { agent } = await ctx.agents.create({ sessionId: SessionId(id), agentOptions })
   return { provider, agent, ctx }
 }
 async function ask(host: Host, text: string, ...script: Step[]): Promise<void> {
@@ -108,7 +141,7 @@ const turnEnd = (host: Host) => {
   return reason.kind === 'aborted' ? `aborted（${reason.reason.kind}）` : reason.kind
 }
 const retries = (host: Host) => events(host).flatMap(e => e.type === 'llm/retry'
-  ? [{ step: e.data.step, retry: e.data.retry, delayMs: e.data.delayMs, code: e.data.failure.code }]
+  ? [{ step: e.data.step, retry: e.data.retry, delayMs: e.data.delayMs, code: e.data.failure.code, status: e.data.failure.status, after: e.data.failure.providerRetryAfterMs }]
   : [])
 const kinds = (host: Host, types: string[]) => events(host).filter(e => types.includes(e.type)).map(e => e.type)
 const tokens = (host: Host) => {
@@ -161,6 +194,18 @@ assert.equal(retries(exhausted).length, 2)
 assert.equal(turnEnd(exhausted), 'error RATE_LIMIT（429 too many requests）')
 assert.deepEqual(retries(twoSteps).map(r => `${r.step}#${r.retry}`), ['1#1', '1#2', '2#1', '2#2'])
 assert.equal(turnEnd(twoSteps), 'completed')
+// 压缩要有可压的内容：先贴两段较长的发布记录。
+const notes = (service: string) => [`${service} 最近的发布记录：`, ...Array.from({ length: 30 }, (_, i) => `${service} 1.${i}.0 ${i % 7 === 3 ? 'failed' : 'succeeded'} 2026-09-${String(1 + (i % 28)).padStart(2, '0')}`)].join('\n')
+const compacted = await boot('with-compaction', { retry: true, compaction: true })
+await ask(compacted, notes('payment-api'), 'text')
+await ask(compacted, notes('order-api'), 'text')
+await ask(compacted, '发布 payment-api 2.5', 'rate', 'rate', 'overflow', 'text')
+const compactedSteps = new Set(retries(compacted).map(r => r.step))
+log(`同时挂压缩插件，同一步里 429、429、上下文超长：llm/retry ${retries(compacted).length} 条（第 ${[...compactedSteps].join('/')} 步），压缩 ${kinds(compacted, ['compaction/end']).length} 次，本轮结束：${turnEnd(compacted)}`)
+assert.equal(retries(compacted).length, 2)
+assert.equal(compactedSteps.size, 1)
+assert.equal(kinds(compacted, ['compaction/end']).length, 1)
+assert.equal(turnEnd(compacted), 'completed')
 
 log('\n== 4. 调用块已经流出来，连接断了 ==')
 const cut = await boot('cut', { retry: true })
@@ -180,6 +225,17 @@ assert.equal(deploys, 1)
 assert.ok(cutFirst !== undefined && cutFirst === cutRetry)
 assert.equal(kinds(cut, ['tool/call']).length, 1)
 assert.equal(tokens(cut), '输入 300、输出 45')
+const cutMid = await boot('cut-mid', { retry: true })
+deploys = 0
+await ask(cutMid, '发布 payment-api 2.5', 'cut-mid', 'call', 'text')
+const midAttempt = events(cutMid).find(e => e.type === 'assistant/attempt')
+assert.ok(midAttempt?.type === 'assistant/attempt')
+const midRecorded = midAttempt.data.stream.flatMap(r => r.type === 'tool-call-chunks' ? [`${r.name}(${r.args.join('')})`] : r.type === 'chunk' ? [r.chunk.type] : [])
+log(`参数流到一半就断开：失败那次的流 ${midRecorded.join('、')}`)
+log(`  重试后平台执行 ${deploys} 次，tool/call ${kinds(cutMid, ['tool/call']).length} 条`)
+assert.deepEqual(midRecorded, ['block-start', 'deploy_release({"service":"payment-)', 'finish'])
+assert.equal(deploys, 1)
+assert.equal(kinds(cutMid, ['tool/call']).length, 1)
 
 log('\n== 5. 哪些失败会重试 ==')
 const verdicts: string[] = []
@@ -198,6 +254,28 @@ assert.deepEqual(verdicts, [
   'always：普通 Error -> 重试，等 20 毫秒，本轮 completed',
   'always：429 且要求等 60 秒 -> 重试，等 20 毫秒，本轮 completed',
 ])
+const classified: string[] = []
+for (const [what, failure, after] of [['带 code 的普通 Error', 'coded', []], ['failure.code 与 code 一致', 'carried', ['text']], ['failure.code 与 code 不一致', 'mismatch', []]] as const) {
+  const host = await boot(`normal-${failure}`, { retry: true })
+  await ask(host, '发布 payment-api 2.5', failure, ...after)
+  const attempt = events(host).find(e => e.type === 'assistant/attempt')
+  const finish = attempt?.type === 'assistant/attempt' ? attempt.data.stream.flatMap(r => r.type === 'chunk' && r.chunk.type === 'finish' && r.chunk.reason.kind === 'error' ? [r.chunk.reason.failure.code] : []) : []
+  classified.push(`normal：${what} -> 记为 ${finish.join('')}，${retries(host).length === 0 ? '不重试' : '重试'}，本轮 ${turnEnd(host).split('（')[0]}`)
+}
+for (const v of classified) log(v)
+assert.deepEqual(classified, [
+  'normal：带 code 的普通 Error -> 记为 UNKNOWN，不重试，本轮 error UNKNOWN',
+  'normal：failure.code 与 code 一致 -> 记为 TRANSPORT，重试，本轮 completed',
+  'normal：failure.code 与 code 不一致 -> 记为 UNKNOWN，不重试，本轮 error UNKNOWN',
+])
+const delegated = await boot('always-compaction', { retry: true, policy: ALWAYS, compaction: true })
+await ask(delegated, notes('payment-api'), 'text')
+await ask(delegated, notes('order-api'), 'text')
+await ask(delegated, '发布 payment-api 2.5', 'overflow', 'text')
+log(`always + 压缩插件，上下文超长：压缩 ${kinds(delegated, ['compaction/end']).length} 次，llm/retry ${retries(delegated).length} 条，本轮 ${turnEnd(delegated)}`)
+assert.equal(kinds(delegated, ['compaction/end']).length, 1)
+assert.equal(retries(delegated).length, 0)
+assert.equal(turnEnd(delegated), 'completed')
 
 log('\n== 6. always 模式遇到认证失败：直到用户取消 ==')
 const stuck = await boot('stuck', { retry: true, policy: ALWAYS })
@@ -212,3 +290,71 @@ assert.equal(stuck.provider.requests.length, 7)
 assert.deepEqual(retries(stuck).map(r => r.delayMs), [20, 40, 80, 160, 200, 200, 200])
 assert.equal(turnEnd(stuck), 'aborted（user）')
 assert.equal(kinds(stuck, ['llm/retry-started']).length, 6)
+const loose = resolveRetryPolicy({ mode: 'always', maxRetries: 2, backoff: { initialDelayMs: 20, maxDelayMs: 200 } } as RetryPolicyConfig, 'demo')
+log(`always 策略写上 maxRetries: 2，解析后只剩：${Object.keys(loose).join(', ')}`)
+const endless = await boot('endless', { retry: true, policy: loose })
+endless.provider.onRequest = (n) => {
+  if (n === 12) setTimeout(() => { endless.agent.cancel({ kind: 'user' }) }, 0)
+}
+await ask(endless, '发布 payment-api 2.5', ...Array.from({ length: 12 }, () => 'auth' as const))
+const endlessDelays = retries(endless).map(r => r.delayMs)
+const early = endlessDelays.slice(0, 4).every((d, i) => Math.abs(d - 20 * 2 ** i) <= 20 * 2 ** i * 0.1)
+const capped = endlessDelays.slice(4)
+log(`按它跑，401 连续 ${endless.provider.requests.length} 次，排了 ${endlessDelays.length} 次重试，本轮结束：${turnEnd(endless)}`)
+log(`  前 4 次等待在 20/40/80/160 毫秒的 ±10% 内：${early}；之后 ${capped.length} 次都在 180–200 毫秒之间：${capped.every(d => d >= 180 && d <= 200)}`)
+assert.equal(loose.mode, 'always')
+assert.ok(!('maxRetries' in loose))
+assert.equal(endless.provider.requests.length, 12)
+assert.equal(endlessDelays.length, 12)
+assert.ok(early)
+assert.equal(capped.length, 8)
+assert.ok(capped.every(d => d >= 180 && d <= 200))
+assert.equal(turnEnd(endless), 'aborted（user）')
+
+log('\n== 7. 真实的 llm-deepseek 适配器：HTTP 429/500/401 映射成什么 ==')
+// 本地 HTTP 服务按顺序回 429（Retry-After: 0.05）、500、401，适配器的 baseURL 指向它。
+const home = mkdtempSync(join(tmpdir(), 'dsh-llm-retry-'))
+process.once('exit', () => { rmSync(home, { recursive: true, force: true }) })
+process.env.DSH_HOME = home
+process.env.DSH_DEMO_DEEPSEEK_KEY = 'sk-demo-local-only'
+const replies = [
+  { status: 429, headers: { 'retry-after': '0.05' }, body: { type: 'error', error: { type: 'rate_limit_error', message: 'rate limited' } } },
+  { status: 500, headers: {}, body: { type: 'error', error: { type: 'api_error', message: 'upstream failed' } } },
+  { status: 401, headers: {}, body: { type: 'error', error: { type: 'authentication_error', message: 'invalid api key' } } },
+]
+const paths: string[] = []
+const server = createServer((req, res) => {
+  paths.push(`${req.method} ${req.url}`)
+  req.resume()
+  const next = replies.shift() ?? { status: 500, headers: {}, body: { type: 'error', error: { type: 'api_error', message: 'script exhausted' } } }
+  res.writeHead(next.status, { 'content-type': 'application/json', ...next.headers })
+  res.end(JSON.stringify(next.body))
+})
+await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+const port = (server.address() as AddressInfo).port
+const real = await boot('deepseek', { retry: true, deepseek: `http://127.0.0.1:${port}` })
+await ask(real, '发布 payment-api 2.5')
+server.close()
+const realRetries = retries(real)
+log(`服务端收到 ${paths.length} 个请求：${[...new Set(paths)].join('、')}`)
+for (const r of realRetries) log(`  llm/retry 第 ${r.retry} 次：${r.code}（HTTP ${r.status}${r.after === undefined ? '' : `，Retry-After ${r.after} 毫秒`}），等 ${r.delayMs} 毫秒`)
+log(`  本轮结束：${turnEnd(real)}`)
+assert.equal(paths.length, 3)
+assert.deepEqual(realRetries.map(r => [r.code, r.status, r.after, r.delayMs]), [['RATE_LIMIT', 429, 50, 50], ['SERVER', 500, undefined, 40]])
+assert.equal(turnEnd(real), 'error AUTH（invalid api key）')
+
+log('\n== 8. 默认策略：连续 5 次 429 实际等了多久 ==')
+const defaults = await boot('defaults', { retry: true, policy: 'default' })
+const started = Date.now()
+await ask(defaults, '发布 payment-api 2.5', 'rate', 'rate', 'rate', 'rate', 'rate', 'text')
+const elapsed = Date.now() - started
+const waits = retries(defaults).map(r => r.delayMs)
+const nominal = [500, 1000, 2000, 4000, 8000]
+const within = waits.length === 5 && waits.every((d, i) => Math.abs(d - (nominal[i] ?? 0)) <= (nominal[i] ?? 0) * 0.1)
+const total = waits.reduce((a, b) => a + b, 0)
+log(`llm/retry ${waits.length} 条，每次等待都在 500/1000/2000/4000/8000 毫秒的 ±10% 内：${within}，本轮结束：${turnEnd(defaults)}`)
+log(`等待合计在 13.95–17.05 秒之间：${total >= 13_950 && total <= 17_050}；整轮耗时不少于等待合计：${elapsed >= total}`)
+assert.ok(within)
+assert.ok(total >= 13_950 && total <= 17_050)
+assert.ok(elapsed >= total)
+assert.equal(turnEnd(defaults), 'completed')

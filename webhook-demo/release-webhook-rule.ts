@@ -13,6 +13,7 @@ export interface Config {
   workspacePath: string
   agentPreset: string
   permissionPreset: string
+  brokenSources: string[]
 }
 export const Config: Schema<Config> = Schema.object({
   sources: Schema.array(Schema.string()).required(),
@@ -20,6 +21,7 @@ export const Config: Schema<Config> = Schema.object({
   workspacePath: Schema.string().required(),
   agentPreset: Schema.string().required(),
   permissionPreset: Schema.string().required(),
+  brokenSources: Schema.array(Schema.string()).default([]),
 })
 
 const str = (value: unknown) => typeof value === 'string' ? value : undefined
@@ -57,7 +59,8 @@ export function apply(ctx: Context, config: Config) {
       return {
         workspacePath: config.workspacePath,
         agentPreset: config.agentPreset,
-        permissionPreset: config.permissionPreset,
+        // brokenSources 模拟规则里把权限预设名写错：建会话在规则返回之后才失败。
+        permissionPreset: config.brokenSources.includes(delivery.source) ? 'read-onyl' : config.permissionPreset,
         title: `排查 ${service} ${version} 发布失败`,
         prompt: [
           '/release-runbook',

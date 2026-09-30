@@ -1,5 +1,6 @@
 # 照 apps/cli/config/examples/github-review/cordis.yml 的写法：webhook 运行时、值班规则，以及隔离出来的第二个 WebServer。
-# 同一个监听器上挂两条路由：/release 不去重，/release-dedup 由规则按投递 id 去重。
+# 同一个监听器上挂三条路由：/release 不去重，/release-dedup 由规则按投递 id 去重，
+# /release-broken 也去重，但规则给它的权限预设名写错了。
 - insert:
     - id: webhook-runtime
       name: '@deepseek-ai/dsh-webhook'
@@ -7,8 +8,9 @@
     - id: release-webhook-rule
       name: './release-webhook-rule.ts'
       config:
-        sources: [release-platform, release-platform-dedup]
-        dedupeSources: [release-platform-dedup]
+        sources: [release-platform, release-platform-dedup, release-platform-broken]
+        dedupeSources: [release-platform-dedup, release-platform-broken]
+        brokenSources: [release-platform-broken]
         workspacePath: !!js process.env.DUTY_WORKSPACE
         agentPreset: standard
         permissionPreset: read-only
@@ -38,5 +40,13 @@
           config:
             source: release-platform-dedup
             path: /release-dedup
+            secretEnv: DUTY_WEBHOOK_SECRET
+            maxBodyBytes: 4096
+
+        - id: release-webhook-adapter-broken
+          name: '@deepseek-ai/dsh-webhook-github'
+          config:
+            source: release-platform-broken
+            path: /release-broken
             secretEnv: DUTY_WEBHOOK_SECRET
             maxBodyBytes: 4096

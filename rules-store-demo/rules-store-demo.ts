@@ -4,7 +4,12 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { LlmAdapter, ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import SessionStore, { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import Storage from '@deepseek-ai/dsh-storage'
 import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import * as StorageJson from '@deepseek-ai/dsh-storage-json'
@@ -36,16 +41,63 @@ const deployRelease = defineTool({
   },
 })
 
+// ── 脚本化模型：每次请求取下一条预先写好的回复（第 3 步的 agent 循环用）──────
+class ScriptedModel extends LlmAdapter {
+  readonly replies: StreamChunk[][] = []
+  /** Simulated time each model request takes before it streams. */
+  latencyMs = 0
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({ provider, id: model, name: model })
+  }
+  async * stream(_options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const next = this.replies.shift()
+    assert.ok(next, 'the scripted model ran out of replies')
+    if (this.latencyMs > 0) await new Promise(resolve => setTimeout(resolve, this.latencyMs))
+    for (const chunk of next) yield chunk
+  }
+}
+let modelCalls = 0
+/** One assistant message carrying every listed deploy call. */
+const deployCalls = (...versions: string[]): StreamChunk[] => [
+  ...versions.flatMap((version, index): StreamChunk[] => {
+    const id = ToolCallId(`model-call-${++modelCalls}`)
+    const json = JSON.stringify({ service: 'payment-api', version })
+    return [
+      { type: 'block-start', index, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index, id, name: 'deploy_release', argumentsDelta: json },
+      { type: 'block-end', index, block: { type: 'tool-call', id, name: 'deploy_release', arguments: json } },
+    ]
+  }),
+  { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
+  { type: 'finish', reason: { kind: 'tool-calls' } },
+]
+const done: StreamChunk[] = [
+  { type: 'block-start', index: 0, blockType: 'text' },
+  { type: 'text-delta', index: 0, text: '好了。' },
+  { type: 'block-end', index: 0, block: { type: 'text', text: '好了。' } },
+  { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
+  { type: 'finish', reason: { kind: 'stop' } },
+]
+
 // ── 宿主：工具运行时 + 存储三件套 + 规则存储插件 ──────────────────────────
 interface Host { ctx: Context; failure?: string }
-async function boot(root: string, config: Config = {}): Promise<Host> {
+async function boot(root: string, config: Config = {}, withAgent = false): Promise<Host> {
   const ctx = new Context()
+  if (withAgent) {
+    await ctx.plugin(LlmRuntime)
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionProjectionRegistry)
+  }
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
   await ctx.plugin(Storage)
   await ctx.plugin(StorageJson, { root })
   await ctx.plugin(StorageDomain, { backend: 'json' })
   ctx.tools.register(deployRelease)
+  if (withAgent) {
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(AgentLoop, { agents: [] })
+  }
   // 规则插件起不来时，宿主其余部分照常运行；这里记下原因，不让它中断脚本。
   const failure = await ctx.plugin(RuleStorePlugin, config).then(() => undefined, (error: unknown) => {
     const { code, detail } = error as { code?: string; detail?: { table: string; key: string } }
@@ -115,6 +167,38 @@ for (const countPending of [false, true]) {
   await store(host)!.flush()
   await host.ctx.fiber.dispose()
 }
+// 换成真实的 agent 循环：三次部署放在同一条模型回复里，或分成三轮回复。
+async function agentRun(countPending: boolean, oneReply: boolean, latencyMs: number): Promise<string> {
+  const host = await boot(freshRoot(), { countPending }, true)
+  const model = new ScriptedModel()
+  model.latencyMs = latencyMs
+  host.ctx.llm.registerAdapter(['mock'], model)
+  await store(host)!.propose(rule(2), '同上')
+  await store(host)!.activate('same-version-failed', 1, '上线')
+  model.replies.push(...oneReply
+    ? [deployCalls('2.3', '2.3', '2.3'), done]
+    : [deployCalls('2.3'), deployCalls('2.3'), deployCalls('2.3'), done])
+  const { agent } = await host.ctx.agents.create({ sessionId: SessionId('oncall'), agentOptions: { provider: 'mock', model: 'mock' } })
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: '把 payment-api 2.3 发上去，失败就重试' }], source: { kind: 'user' } }))
+  await agent.whenIdle()
+  assert.equal(model.replies.length, 0)
+  const outcomes = toolResults(agent).map(isError => isError ? '拒绝' : '执行')
+  await store(host)!.flush()
+  await host.ctx.fiber.dispose()
+  return outcomes.join('/')
+}
+// oxlint-disable-next-line typescript/no-deprecated -- the demo reads the whole log on purpose
+const toolResults = (agent: Agent) => agent.session.snapshotEvents().flatMap((e: SessionEvent) => e.type === 'tool/result'
+  ? e.data.message.content.flatMap(b => b.type === 'tool-result' ? [b.isError === true] : [])
+  : [])
+const loopRuns: [string, string][] = []
+const loopCases = [[false, true, 200], [false, false, 0], [false, false, 200], [true, true, 0]] as const
+for (const [countPending, oneReply, latencyMs] of loopCases) {
+  const label = `agent 循环 countPending=${countPending}，${oneReply ? '同一条回复连发 3 次' : '分 3 轮各发 1 次'}，模型请求耗时 ${latencyMs}ms`
+  loopRuns.push([label, await agentRun(countPending, oneReply, latencyMs)])
+}
+for (const [label, outcomes] of loopRuns) log(`${label}：${outcomes}`)
+assert.deepEqual(loopRuns.map(([, o]) => o), ['执行/执行/执行', '执行/执行/执行', '执行/执行/拒绝', '执行/执行/拒绝'])
 
 log('\n== 4. 关宿主时还在排队的写入 ==')
 const root4 = freshRoot()
@@ -128,9 +212,20 @@ const lost = store(c)!
 await c.ctx.fiber.dispose()
 log(`不 flush 直接关：写入失败 ${lost.writeErrors.length} 条，${lost.writeErrors[0] ?? '-'}`)
 const d = await boot(root4)
-log(`重启后历史 ${store(d)!.history().length} 条；deploy(2.3) -> ${await deploy(d, '2.3')}`)
-assert.ok(lost.writeErrors.length > 0)
-assert.ok(store(d)!.history().length < 3)
+const landed = store(d)!.history().length
+log(`重启后历史 ${landed} 条；deploy(2.3) -> ${await deploy(d, '2.3')}`)
+assert.equal(lost.writeErrors.length, 2)
+assert.equal(landed, 1)
+// 对照：监听器不自己接住失败，直接返回 rejected promise。
+const warnings: string[] = []
+d.ctx.logger.exporter({ levels: { default: 3 }, export: (m) => { if (m.type === 'warn') warnings.push(String(m.args[0])) } })
+const disposeRejecting = d.ctx.on('tools/result', () => Promise.reject(new Error('unit closed')))
+const withRejecting = await deploy(d, '2.4')
+await new Promise(resolve => setTimeout(resolve, 10))
+disposeRejecting()
+log(`监听器直接返回 rejected promise：deploy(2.4) -> ${withRejecting}；dsh 只记 ${warnings.length} 条 warn：${warnings[0] ?? '-'}`)
+assert.equal(withRejecting, '执行 succeeded')
+assert.deepEqual(warnings, ['tool "deploy_release" (call-' + calls + '): tools/result observer failed: unit closed'])
 await store(d)!.flush()
 await d.ctx.fiber.dispose()
 
@@ -161,6 +256,15 @@ assert.equal(platformRuns - before5, 1)
 await reopened.ctx.fiber.dispose()
 
 log('\n== 6. per-record + backup-and-skip：坏记录挪走，其余照常 ==')
+const root6s = freshRoot()
+const singleSkip = rulesDomain({ invalidRecords: 'backup-and-skip' })
+const s1 = await boot(root6s, { trustProposals: true, domain: singleSkip })
+await store(s1)!.propose(rule('2'), '模型给的阈值是字符串')
+await s1.ctx.fiber.dispose()
+const s2 = await boot(root6s, { domain: singleSkip })
+log(`single + backup-and-skip 重启 -> ${s2.failure ?? '成功'}`)
+assert.equal(s2.failure, 'invalid-record，revisions/same-version-failed_1 不符合 schema')
+await s2.ctx.fiber.dispose()
 const root6 = freshRoot()
 const skipDomain = rulesDomain({ layout: 'per-record', invalidRecords: 'backup-and-skip' })
 const e = await boot(root6, { trustProposals: true, domain: skipDomain })
@@ -188,6 +292,11 @@ for (const layout of ['single', 'per-record'] as const) {
   const root = freshRoot()
   const domain = rulesDomain({ layout })
   const [ops, agentHost] = [await boot(root, { domain }), await boot(root, { domain })]
+  const changes = [ops, agentHost].map((host) => {
+    const seen: string[] = []
+    host.ctx.on('domain/changed', (change) => { seen.push(change.table) })
+    return seen
+  })
   await store(ops)!.propose(rule(2), '运维在另一个进程里加规则')
   await store(ops)!.activate('same-version-failed', 1, '上线')
   const before: number = platformRuns
@@ -197,6 +306,9 @@ for (const layout of ['single', 'per-record'] as const) {
     await store(host)!.flush()
     await host.ctx.fiber.dispose()
   }
+  const [opsSaw, agentSaw] = changes.map(seen => [...new Set(seen)].join('+') + ` ${seen.length} 条`)
+  log(`${layout}：domain/changed 运维宿主收到 ${opsSaw}，agent 宿主收到 ${agentSaw}`)
+  assert.deepEqual(changes, [['revisions', 'active'], ['events', 'events', 'events']])
   const later = await boot(root, { domain })
   log(`${layout}：两边都关掉再打开：生效规则 [${store(later)!.active().join(', ')}]，历史 ${store(later)!.history().length} 条`)
   assert.equal(platformRuns - before, 3)

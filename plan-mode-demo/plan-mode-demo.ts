@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, { LlmAdapter, ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmResolvedModelInfo, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId, SessionLogOffset, type SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import * as checkpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
@@ -15,8 +15,9 @@ import ToolRuntime, { defineTool, type PreToolDecision } from '@deepseek-ai/dsh-
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
-import UserQuestionService, { type AskUserQuestionAnswer, type AskUserQuestionItem } from '@deepseek-ai/dsh-user-questions'
-import ApprovalService, { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
+import UserQuestionService, { UserQuestionError, type AskUserQuestionAnswer, type AskUserQuestionItem } from '@deepseek-ai/dsh-user-questions'
+import ApprovalService from '@deepseek-ai/dsh-user-approval'
+import PermissionPresetService from '@deepseek-ai/dsh-permission-presets'
 import PlanModeController from '@deepseek-ai/dsh-plan-mode'
 
 const log = (msg: string) => { console.log(msg) }
@@ -87,6 +88,7 @@ const deployRelease = defineTool({
 // ── 宿主：agent 循环 + 命令 + 用户提问 + plan-mode，会话落盘到 JSONL ─────────────
 const sessionsDir = join(base, 'sessions')
 const agentOptions = { provider: 'scripted', model: 'mock' }
+let planFiber: { dispose: () => Promise<unknown> } | undefined
 async function boot(): Promise<{ ctx: Context; model: ScriptedModel }> {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
@@ -100,7 +102,9 @@ async function boot(): Promise<{ ctx: Context; model: ScriptedModel }> {
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(CommandRuntime)
   await ctx.plugin(UserQuestionService)
-  await ctx.plugin(PlanModeController, { section: SECTION })
+  const fiber = ctx.plugin(PlanModeController, { section: SECTION })
+  await fiber
+  planFiber = fiber as unknown as { dispose: () => Promise<unknown> }
   // plan-mode 的 /plan 命令挂在 commands 服务就绪之后。
   await new Promise(resolve => setImmediate(resolve))
   const model = new ScriptedModel()
@@ -277,7 +281,7 @@ assert.deepEqual(seenByGuard, ['{"active":true}', '{"active":true,"pending":fals
 assert.equal(r4[3]?.text, 'payment-api 2.9 已上线')
 assert.deepEqual(platform, ['2.9'])
 
-log('\n== 5. 叠加审批：部署要人批，审批策略切到 never ==')
+log('\n== 5. 叠加审批：部署要人批，再切到 danger-full-access 预设 ==')
 platform.length = 0
 await ctx.plugin(ApprovalService, { policy: 'ask' })
 ctx.on('tools/pre-execute', (exec, next): Promise<PreToolDecision> =>
@@ -293,8 +297,18 @@ await say(fourth, '发布 payment-api 3.0', { calls: [deploy('3.0')] }, { text: 
 log(`  计划模式中部署 | 审批人被问 ${String(approvals.length)} 次（${String(approvals[0])}），批准；结果 ${String(results(fourth)[0]?.text)}`)
 assert.deepEqual(approvals, ['deploy_release：部署生产要值班负责人批准'])
 assert.equal(results(fourth)[0]?.text, 'Error: 计划模式下不部署，先用 exit_plan_mode 提交计划')
-// danger-full-access 预设写的就是这一条 approval/policy。
-setApprovalPolicy(fourth.session, 'never')
+// 权限预设服务按基础组合的预设表挂上；它要求 bash 执行器声明沙箱模式，这里用一个只带 sandboxMode 的占位。
+;(ctx as unknown as { provide: (name: string, value: object) => void }).provide('shell', { sandboxMode: 'workspace-write' })
+await ctx.plugin(PermissionPresetService, { presets: {
+  'read-only': { sandbox: 'read-only', approval: 'ask' },
+  'workspace-write': { sandbox: 'workspace-write', approval: 'ask' },
+  'danger-full-access': { sandbox: 'danger-full-access', approval: 'never' },
+} })
+const knobsBefore = events(fourth).length
+ctx.permissionPresets.set(fourth.session, 'danger-full-access')
+const knobEvents = events(fourth).slice(knobsBefore).map(e => `${e.type} ${json(e.data)}`)
+log(`  切到 danger-full-access 预设写入 | ${knobEvents.join('；')}`)
+assert.deepEqual(knobEvents, ['permission/preset {"preset":"danger-full-access"}', 'sandbox/mode {"mode":"danger-full-access"}', 'approval/policy {"policy":"never"}'])
 answers.push({ answers: [{ id: 'plan-review', selected: ['Approve'] }] })
 const reviewsBefore = asked.length
 await say(fourth, '提交计划', { calls: [exitPlan(PLAN.replace('2.8', '3.0'))] }, { calls: [deploy('3.0')] }, { text: '部署被拒。' })
@@ -344,5 +358,59 @@ log(`    人发“继续” | 含计划引导：${String(guided(after[0]))}，�
 assert.deepEqual(ctx.planMode.get(resumed), { active: true })
 assert.equal(guided(after[0]), true)
 assert.deepEqual(planView(resumed), { active: true, pending: true })
+
+log('\n== 7. 评审没有得到回答：关掉评审改为发言、评审期间 plan-mode 重载 ==')
+// 重启后的宿主重新挂一个评审人；每次评审按队列里的动作回应。
+const reviewActions: (() => Promise<AskUserQuestionAnswer>)[] = []
+ctx.on('user-questions/request', () => {
+  const action = reviewActions.shift()
+  assert.ok(action, 'unexpected plan review')
+  return action()
+})
+const approve = () => Promise.resolve<AskUserQuestionAnswer>({ answers: [{ id: 'plan-review', selected: ['Approve'] }] })
+reviewActions.push(
+  // 界面上关掉评审、回到输入框。
+  () => Promise.reject(new UserQuestionError('the user dismissed the question', 'ASK_CANCELLED')),
+  // 评审还没回答时 plan-mode 被重载（例如改了配置），随后才点批准。
+  async () => {
+    await planFiber?.dispose()
+    const fiber = ctx.plugin(PlanModeController, { section: SECTION })
+    await fiber
+    planFiber = fiber as unknown as { dispose: () => Promise<unknown> }
+    return await approve()
+  },
+)
+const seventh = await open('oncall-7')
+await slash(seventh, '/plan')
+const r7Requests = await say(seventh, '准备发 payment-api 3.2', { calls: [exitPlan(PLAN.replace('2.8', '3.2'))] }, { calls: [exitPlan(PLAN.replace('2.8', '3.2'))] }, { text: '重新提交前先等你的意见。' })
+const r7 = results(seventh)
+log(`  评审人关掉评审改为发言 | ${String(r7[0]?.text)}`)
+log(`  评审期间 plan-mode 重载 | ${String(r7[1]?.text)}`)
+log(`  这一轮后计划状态 ${json(ctx.planMode.get(seventh))}，最后一次请求含计划引导：${String(guided(r7Requests.at(-1)))}`)
+assert.equal(r7[0]?.text, 'Error: The user dismissed the plan review to speak instead; stay in plan mode, stop here, and wait for their message.')
+assert.equal(r7[1]?.text, 'Error: the plan-mode service was reloaded while the plan was under review; present the plan again')
+assert.deepEqual(ctx.planMode.get(seventh), { active: true })
+assert.equal(guided(r7Requests.at(-1)), true)
+assert.equal(reviewActions.length, 0)
+
+log('\n== 8. fork 继承已记录的计划状态 ==')
+const parentEvents = events(seventh)
+const cut = parentEvents.findLast(e => e.type === 'turn/end')
+assert.ok(cut)
+const seed = parentEvents.slice(0, cut.seq + 1)
+const forked = (await ctx.agents.create({
+  sessionId: SessionId('oncall-7-fork'),
+  seed,
+  inheritedEventCount: SessionLogOffset(seed.length),
+  meta: { parentSession: seventh.session.header.id, isSeeded: true },
+  agentOptions,
+})).agent
+const fresh = await open('oncall-8')
+log(`  fork 出的会话 | 计划状态 ${json(ctx.planMode.get(forked))}；新开的会话 | 计划状态 ${json(ctx.planMode.get(fresh))}`)
+const forkTurn = await say(forked, '在分支里继续规划', { text: '好的。' })
+log(`  fork 出的会话第一次请求 | 含计划引导：${String(guided(forkTurn[0]))}`)
+assert.deepEqual(ctx.planMode.get(forked), { active: true })
+assert.deepEqual(ctx.planMode.get(fresh), { active: false })
+assert.equal(guided(forkTurn[0]), true)
 
 await ctx.fiber.dispose()

@@ -1,11 +1,12 @@
 # goal-demo
 
-配套文章《DeepSeek Harness 源码：巡检目标自动续跑了 5 轮，只查 2 个服务就说完成也照样通过》（系列第 18 篇）。
+配套文章《DeepSeek Harness 源码：只查 2 个服务就说完成，巡检目标照样通过》（系列第 18 篇）。
 
 用“巡检 5 个服务最近一次发布，找出失败的”这个目标，挂载真实的 `dsh-goal`、`dsh-tool-goal`、`dsh-goal-round-driver` 验证同会话续跑：
 一条人类消息之后驱动器自动开 5 轮并完成；模型只查 2 个服务就标记完成也被接受（没有评估器）；
 受阻门槛只比较轮次编号，第 3 轮第一次报受阻也被接受；轮数上限由模型在 `create_goal` 里给出，用完后记 `round-limit`；
 巡检到一半销毁 Context，恢复后目标仍是 active 但续行被停用，经过一次空闲也不会自己续跑，要人类说“继续”才恢复。
+另外验证：驱动器排进第 1 轮的同时插进插件消息，第 1 轮的 goal 消息被领取两次；人类那一轮可以直接标记受阻；从第 1 轮结束处 fork；插件消息那一轮模型不能 `resume`，要人类直接发话；被中断的第 2 轮计入轮数；子进程不挂 checkpoint 插件时 SIGKILL 后只恢复到第 1 轮。
 
 ## 运行
 
@@ -18,7 +19,7 @@ cp -R scratch-plugin/deepseek-harness-demo/goal-demo scratch-plugin/goal-demo
 node --import tsx/esm scratch-plugin/goal-demo/goal-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-goal` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
+文章首次发布时的代码保留在 `dsh-goal` 分支；2026-09-30 补测后，`master` 上的本目录新增了步骤与断言，与该分支不同。
 
 模型是脚本里写死每一轮动作的假适配器，不需要 API key，也不调用真实模型；发布数据是合成的。
 会话日志写在系统临时目录下，进程退出时删除。“进程退出”是在同一个 Node 进程里销毁再重建 Context 模拟的，没有真的杀进程。

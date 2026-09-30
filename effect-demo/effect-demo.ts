@@ -4,7 +4,7 @@ import { Context, FiberState, Service } from '@deepseek-ai/cordis'
 
 declare module '@deepseek-ai/cordis' {
   interface Context { toolbox: Toolbox }
-  interface Events { 'release/changed'(id: string): void }
+  interface Events { 'release/changed'(id: string): void; 'demo/drain'(id: string): void }
 }
 
 const log = (msg: string) => { console.log(msg) }
@@ -70,4 +70,71 @@ await again
 await toolboxFiber.dispose()
 log(`  dependent state=${again.state} (0=PENDING)`)
 assert.equal(again.state, FiberState.PENDING)
+
+log('6. provide toolbox again')
+const toolboxAgain = root.plugin(Toolbox)
+await toolboxAgain
+await again
+log(`  dependent state=${again.state} (2=ACTIVE) tools=${[...root.toolbox.tools.keys()]}`)
+assert.equal(again.state, FiberState.ACTIVE)
+assert.deepEqual([...root.toolbox.tools.keys()], ['lookup_release'])
+
+log('7. call one disposer twice')
+let closed = 0
+const once = again.ctx.effect(() => () => { closed++ })
+once()
+once()
+log(`  disposer ran ${closed} time(s)`)
+assert.equal(closed, 1)
+
+log('8. effect while the fiber is unloading')
+let unloadingError: (Error & { code?: string }) | undefined
+const reentrant = root.plugin({ name: 'reentrant', apply(ctx: Context) {
+  ctx.effect(() => () => {
+    log(`  state=${ctx.fiber.state} (5=UNLOADING)`)
+    try { ctx.effect(() => () => {}) } catch (e) { unloadingError = e as Error & { code?: string } }
+  })
+} })
+await reentrant
+await reentrant.dispose()
+log(`  ${unloadingError?.name}: ${unloadingError?.code}`)
+assert.equal(unloadingError?.code, 'INACTIVE_EFFECT')
+
+log('9. async disposer yielded last in a generator effect')
+const composite = (label: string, yieldListener: boolean) => ({ name: label, apply(ctx: Context) {
+  ctx.effect(function* () {
+    const off = ctx.on('demo/drain', id => { drained.push(`${label}:${id}`); log(`  listener still on: ${id}`) })
+    if (yieldListener) yield off
+    yield async () => {
+      log(`  ${label}: async disposer start, emit ${label}`)
+      root.emit('demo/drain', label)
+      await new Promise(r => setTimeout(r, 20))
+      log(`  ${label}: async disposer end`)
+    }
+  })
+} })
+const drained: string[] = []
+for (const [label, yieldListener] of [['bare-on', false], ['yield-on', true]] as const) {
+  const fiber = root.plugin(composite(label, yieldListener))
+  await fiber
+  await fiber.dispose()
+}
+assert.deepEqual(drained, ['yield-on:yield-on'])
+
+log('10. two async effects on one fiber unload concurrently')
+const timeline: string[] = []
+const slowFast = root.plugin({ name: 'slow-fast', apply(ctx: Context) {
+  const effect = (label: string, ms: number) => ctx.effect(() => async () => {
+    timeline.push(`${label} start`); log(`  ${label} start`)
+    await new Promise(r => setTimeout(r, ms))
+    timeline.push(`${label} end`); log(`  ${label} end`)
+  })
+  effect('A(10ms)', 10)
+  effect('B(50ms)', 50)
+} })
+await slowFast
+await slowFast.dispose()
+assert.deepEqual(timeline, ['B(50ms) start', 'A(10ms) start', 'A(10ms) end', 'B(50ms) end'])
+
+log('11. dispose root')
 await root.fiber.dispose()

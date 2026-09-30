@@ -17,6 +17,10 @@ import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import { LocalBashExecutor } from '@deepseek-ai/dsh-bash-local'
 import * as HooksClaude from '@deepseek-ai/dsh-hooks-claude-code'
+import { LocalSandboxProvider } from '@deepseek-ai/dsh-sandbox-local'
+import { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
+import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
+import PtcRuntimeNode from '@deepseek-ai/dsh-ptc-runtime-node'
 import { ReleaseRules, failedTwiceIn24h, rulePlugin } from './release-rules.ts'
 
 const log = (msg: string) => { console.log(msg) }
@@ -26,6 +30,8 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const now = Date.UTC(2026, 8, 28, 1)
 // 宿主进程里有一个凭据形的环境变量（假值），看 hook 进程能不能读到。
 process.env.RELEASE_API_TOKEN = 'demo-token'
+// 再放一个 DSH_ 开头、名字不像凭据的变量。
+process.env.DSH_DEMO_MARKER = 'on'
 
 // ── 脚本化模型：每轮调一次工具，看到工具结果后回一句话 ─────────────────────────────
 interface Call { name: string; args: object }
@@ -100,23 +106,35 @@ interface HostOptions {
   /** 在 hooks 桥接之前或之后注册一个“冻结窗口”pre-execute 监听器。 */
   freeze?: 'before' | 'after'
   approval?: boolean
+  /** 在 hooks 桥接之后注册一个插件：'pre' 在 pre-execute 上只计数；'post' 在 post-execute 上计数，对 2.4 返回 block。 */
+  later?: 'pre' | 'post'
+  /** tools 用 PTC 模式（第 25 篇同款）。 */
+  ptc?: boolean
 }
-interface Host { ctx: Context; model: ScriptedModel; agent: Agent; workspace: string; platform: string[]; asks: string[] }
+interface Host { ctx: Context; model: ScriptedModel; agent: Agent; workspace: string; platform: string[]; asks: string[]; later: { pre: number; post: number }; logs: string[] }
 let hosts = 0
 async function boot(options: HostOptions): Promise<Host> {
   const workspace = join(base, `workspace-${++hosts}`)
   mkdirSync(workspace)
   writeFileSync(join(workspace, 'hooks.json'), JSON.stringify(hooksJson(options.hooks)))
   const ctx = new Context()
+  const logs: string[] = []
+  ctx.logger.exporter({ levels: { default: 3 }, export: (m) => { logs.push(String(m.args[0])) } })
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(ToolRuntime, options.ptc === true ? { mode: 'ptc' } : {})
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(LocalSubprocessRuntime)
   await ctx.plugin(LocalBashExecutor, { timeoutMs: 10_000 })
+  if (options.ptc === true) {
+    await ctx.plugin(LocalSandboxProvider, {})
+    await ctx.plugin(SandboxPolicyService, { mode: 'workspace-write', workspaceRoot: workspace })
+    await ctx.plugin(LocalFileSystem, { cwd: workspace })
+    await ctx.plugin(PtcRuntimeNode)
+  }
   const asks: string[] = []
   if (options.approval === true) {
     await ctx.plugin(ApprovalService, { policy: 'ask' })
@@ -132,6 +150,22 @@ async function boot(options: HostOptions): Promise<Host> {
   if (options.freeze === 'before') freeze()
   await ctx.plugin(HooksClaude, { configPath: join(workspace, 'hooks.json'), pluginRoot: HERE })
   if (options.freeze === 'after') freeze()
+  const later = { pre: 0, post: 0 }
+  if (options.later === 'pre') {
+    ctx.on('tools/pre-execute', (exec, next) => {
+      if (exec.name === 'deploy_release') later.pre++
+      return next()
+    })
+  }
+  if (options.later === 'post') {
+    ctx.on('tools/post-execute', (exec, _result, next) => {
+      if (exec.name !== 'deploy_release') return next()
+      later.post++
+      return (exec.arguments as { version?: unknown }).version === '2.4'
+        ? Promise.resolve({ kind: 'block', feedback: [{ type: 'text', text: '值班规则：2.4 先灰度' }] } as const)
+        : next()
+    })
+  }
   if (options.rules === true) {
     await ctx.plugin(ReleaseRules, { now: () => now })
     await ctx.plugin(rulePlugin(failedTwiceIn24h))
@@ -145,7 +179,7 @@ async function boot(options: HostOptions): Promise<Host> {
     meta: { cwd: workspace },
     agentOptions: { provider: 'scripted', model: 'mock' },
   })
-  return { ctx, model, agent, workspace, platform, asks }
+  return { ctx, model, agent, workspace, platform, asks, later, logs }
 }
 async function deploy(host: Host, version: string): Promise<string> {
   host.model.calls.push({ name: 'deploy_release', args: { service: 'payment-api', version } })
@@ -163,7 +197,7 @@ function lastResult(host: Host): string {
   const text = block.content.map(c => c.type === 'text' ? c.text : '').join('')
   return block.isError ? `报错「${text}」` : text
 }
-type HookEntry = { mode: string; payload: Record<string, unknown>; cwd: string; token: string }
+type HookEntry = { mode: string; payload: Record<string, unknown>; cwd: string; token: string; dsh: string; at: number }
 const hookLedger = (host: Host): HookEntry[] => {
   try {
     return readFileSync(join(host.workspace, 'hook-ledger.jsonl'), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as HookEntry)
@@ -187,6 +221,7 @@ log(`平台执行 ${frozen.platform.length} 次`)
 log(`hook 从 stdin 收到的字段：${Object.keys(seen.payload).join(', ')}`)
 log(`  tool_input = ${JSON.stringify(seen.payload.tool_input)}，transcript_path = ${JSON.stringify(seen.payload.transcript_path)}`)
 log(`  hook 的工作目录是会话工作区：${String(seen.cwd === frozen.workspace)}；宿主的 RELEASE_API_TOKEN 在 hook 进程里：${seen.token}`)
+log(`  宿主的 DSH_DEMO_MARKER 在 hook 进程里：${seen.dsh}`)
 const [record] = hookResults(frozen)
 log(`会话日志记下 hook/result：${JSON.stringify({ point: record?.point, decision: record?.decision, exitCode: record?.exitCode, stderrSummary: record?.stderrSummary })}`)
 assert.equal(blocked, '报错「Error: 发布冻结中，2.4 等窗口结束再部署」')
@@ -195,6 +230,7 @@ assert.deepEqual(Object.keys(seen.payload), ['session_id', 'transcript_path', 'c
 assert.equal(seen.payload.transcript_path, '')
 assert.equal(seen.cwd, frozen.workspace)
 assert.equal(seen.token, 'absent')
+assert.equal(seen.dsh, 'absent')
 assert.deepEqual(events(frozen).filter(e => e.type.startsWith('hook/')).map(e => e.type), ['hook/invoked', 'hook/result'])
 assert.equal(record?.decision, 'block')
 assert.equal(record?.exitCode, 2)
@@ -256,6 +292,35 @@ assert.equal(hookFirst.asks.length, 1)
 assert.equal(freezeFirstResult, '报错「Error: freeze-window 插件：发布冻结中」')
 assert.equal(hookLedger(freezeFirst).length, 0)
 
+const denying = await boot({ hooks: [{ event: 'PreToolUse', matcher: 'deploy_release', mode: 'deny' }], later: 'pre' })
+const denied = await deploy(denying, '2.4')
+const allowingLater = await boot({ hooks: [{ event: 'PreToolUse', matcher: 'deploy_release', mode: 'allow' }], later: 'pre' })
+await deploy(allowingLater, '2.4')
+log(`hook 返回 deny：${denied}；后注册的 pre-execute 插件运行 ${denying.later.pre} 次（hook 返回 allow 时 ${allowingLater.later.pre} 次）`)
+assert.equal(denied, '报错「Error: hook 拒绝 2.4」')
+assert.equal(denying.later.pre, 0)
+assert.equal(allowingLater.later.pre, 1)
+
+const pre = (mode: string): HookSpec => ({ event: 'PreToolUse', matcher: 'deploy_release', mode })
+const strictest = await boot({ hooks: [pre('allow'), pre('ask'), pre('deny')], approval: true })
+const strictestResult = await deploy(strictest, '2.4')
+const loose = await boot({ hooks: [pre('ask'), pre('allow')], approval: true })
+const looseResult = await deploy(loose, '2.4')
+log(`同一事件配 allow、ask、deny 三个 hook：依次运行 ${hookLedger(strictest).map(e => e.mode).join('、')}，结果 ${strictestResult}，审批请求 ${strictest.asks.length} 次`)
+log(`配 ask、allow 两个：结果 ${looseResult}，审批请求 ${loose.asks.length} 次`)
+const napping = await boot({ hooks: [pre('nap'), pre('nap')] })
+await deploy(napping, '2.4')
+const naps = hookLedger(napping)
+const gap = (naps[1]?.at ?? 0) - (naps[0]?.at ?? 0)
+log(`同一条命令配两次、各占 300 毫秒：运行 ${naps.length} 次，第二个比第一个晚开始 300 毫秒以上：${gap >= 300}`)
+assert.deepEqual(hookLedger(strictest).map(e => e.mode), ['allow', 'ask', 'deny'])
+assert.equal(strictestResult, '报错「Error: hook 拒绝 2.4」')
+assert.equal(strictest.asks.length, 0)
+assert.equal(looseResult, 'payment-api 2.4 succeeded')
+assert.equal(loose.asks.length, 1)
+assert.equal(naps.length, 2)
+assert.ok(gap >= 300)
+
 log('\n== 4. PostToolUse：部署已经执行，hook 只能改结果 ==')
 const checked = await boot({ hooks: [{ event: 'PostToolUse', matcher: 'deploy_release', mode: 'post-check' }], rules: true })
 const postResults: string[] = []
@@ -269,6 +334,18 @@ const fine = await deploy(checked, '2.4')
 log(`部署 2.4：${fine}；模型下一次请求里多了一条插件消息：${pluginMessages(checked).join(' / ')}`)
 assert.equal(fine, 'payment-api 2.4 succeeded')
 assert.deepEqual(pluginMessages(checked), ['2.4 已上线，记得 10 分钟后看错误率'])
+const layered = await boot({ hooks: [{ event: 'PostToolUse', matcher: 'deploy_release', mode: 'post-check' }], later: 'post' })
+const layeredFailed = await deploy(layered, '2.3')
+const postAfterBlock = layered.later.post
+const layeredFine = await deploy(layered, '2.4')
+log(`后面再注册一个 post-execute 插件（对 2.4 返回 block）：`)
+log(`  部署 2.3：${layeredFailed}，后面的插件运行 ${postAfterBlock} 次`)
+log(`  部署 2.4：${layeredFine}，后面的插件运行 ${layered.later.post - postAfterBlock} 次；hook 的附加消息仍在：${pluginMessages(layered).join(' / ')}`)
+assert.equal(layeredFailed, '报错「2.3 部署失败，先查原因再重试」')
+assert.equal(postAfterBlock, 0)
+assert.equal(layeredFine, '报错「值班规则：2.4 先灰度」')
+assert.equal(layered.later.post - postAfterBlock, 1)
+assert.deepEqual(pluginMessages(layered), ['2.4 已上线，记得 10 分钟后看错误率'])
 
 log('\n== 5. Stop：强制继续没有上限 ==')
 const smoke = await boot({ hooks: [{ event: 'Stop', mode: 'stop-smoke' }] })
@@ -291,4 +368,26 @@ log(`按 stop_hook_active 自我限制的 hook：Stop 运行 ${hookLedger(loopin
 assert.equal(looping.model.requests.length, 12)
 assert.ok(hookLedger(looping).every(e => e.payload.stop_hook_active === false))
 
-await Promise.all([frozen, control, asking, allowing, hookFirst, freezeFirst, checked, smoke, looping].map(host => host.ctx.fiber.dispose()))
+log('\n== 6. PTC 程序里的子调用、updatedInput ==')
+const programmed = await boot({ hooks: [pre('freeze')], ptc: true })
+programmed.model.calls.push({ name: 'run_code', args: { description: 'Deploy', code: `try { return (await tools.deploy_release({ service: 'payment-api', version: '2.4' })).outcome } catch (error) { return 'caught: ' + error.message }` } })
+programmed.agent.followup(createUserMessage({ content: [{ type: 'text', text: '写程序发布 payment-api 2.4' }], source: { kind: 'user' } }))
+await programmed.agent.whenIdle()
+const [sub] = hookLedger(programmed)
+log(`PTC 程序里调 deploy_release：程序拿到 ${lastResult(programmed)}，平台执行 ${programmed.platform.length} 次`)
+log(`  hook 收到 tool_name = ${String(sub?.payload.tool_name)}，tool_use_id = ${String(sub?.payload.tool_use_id)}`)
+assert.equal(lastResult(programmed), 'caught: 发布冻结中，2.4 等窗口结束再部署')
+assert.equal(programmed.platform.length, 0)
+assert.equal(sub?.payload.tool_name, 'deploy_release')
+assert.equal(sub?.payload.tool_use_id, 'call-1:ptc:1')
+
+const rewriting = await boot({ hooks: [pre('rewrite')] })
+const rewritten = await deploy(rewriting, '2.4')
+const ignored = rewriting.logs.filter(t => t.includes('updatedInput'))
+log(`hook 放行并要求把版本改成 2.5：${rewritten}，平台收到 ${rewriting.platform.join(', ')}`)
+log(`  logger：${ignored.join(' / ')}`)
+assert.equal(rewritten, 'payment-api 2.4 succeeded')
+assert.deepEqual(rewriting.platform, ['2.4'])
+assert.deepEqual(ignored, ['hooks-claude-code: PreToolUse hook requested updatedInput, which is not yet honored (ignored)'])
+
+await Promise.all([frozen, control, asking, allowing, hookFirst, freezeFirst, denying, allowingLater, strictest, loose, napping, checked, layered, smoke, looping, programmed, rewriting].map(host => host.ctx.fiber.dispose()))

@@ -1,0 +1,9 @@
+# 叠在 headless profile 之上：默认模型换成把指令段标题念回来的 scripted/mock。
+- id: agent-default-model
+  config:
+    provider: scripted
+    model: mock
+
+- insert:
+    - id: instructions-cli-probe
+      name: './cli-probe.ts'

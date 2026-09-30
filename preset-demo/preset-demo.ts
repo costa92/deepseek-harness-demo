@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { rmSync } from 'node:fs'
 import { mkdir, mkdtemp, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
@@ -17,6 +18,8 @@ import AgentRegistry, { assembleContextFor, type Agent } from '@deepseek-ai/dsh-
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import AgentPresets, { livePresetMounts } from '@deepseek-ai/dsh-agent-presets'
 import type { Config } from '@deepseek-ai/dsh-agent-presets'
+import * as Persona from '@deepseek-ai/dsh-persona'
+import Skills from '@deepseek-ai/dsh-skill'
 
 const log = (msg: string) => { console.log(msg) }
 
@@ -103,6 +106,7 @@ async function host(roster: Config): Promise<Context> {
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SystemPrompt, { personaPrefix: '你是通用编码助手。', includeHarnessIdentity: false })
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(Skills)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(AgentPresets, roster)
@@ -114,6 +118,8 @@ ctx.tools.register(hostTool('host_shell'))
 const model = new ScriptedModel()
 ctx.llm.registerAdapter(['mock'], model)
 
+/** Undo handles of the agent-scope masks `open` installed, by session id. */
+const masks = new Map<string, () => void>()
 /** Create one session the way a host factory does: join the preset inside `setup`, optionally mask at agent scope. */
 async function open(id: string, presetId?: string, agentMask?: ToolRestriction): Promise<Agent> {
   const { agent } = await ctx.agents.create({
@@ -121,7 +127,7 @@ async function open(id: string, presetId?: string, agentMask?: ToolRestriction):
     agentOptions: { provider: 'mock', model: 'mock' },
     setup: async (agentCtx: Context) => {
       await ctx.agentPresets.mount(agentCtx, presetId)
-      if (agentMask !== undefined) agentCtx.tools.restrict(agentMask)
+      if (agentMask !== undefined) masks.set(id, agentCtx.tools.restrict(agentMask))
     },
   })
   return agent
@@ -174,6 +180,16 @@ const s3 = await open('s3', 'release-oncall')
 assert.equal(tools(s3), tools(s1))
 assert.equal(mounts('release-oncall'), 1)
 log(`s3 也选 release-oncall：常驻挂载仍是 ${mounts('release-oncall')} 份`)
+await put('oncall-race/agent.cordis.yml', oncall())
+const [r1, r2] = await Promise.all([open('r1', 'oncall-race'), open('r2', 'oncall-race')])
+assert.equal(tools(r1), tools(r2))
+assert.equal(mounts('oncall-race'), 1)
+log(`r1、r2 同时首次选 oncall-race：常驻挂载 ${mounts('oncall-race')} 份`)
+// 另起一个宿主，把 dsh-persona 挂到全局层。
+const bare = await host({ default: 'general', roots: [{ path: presets, trust: 'system' }], includeShippedRoot: false, includeUserRoot: false })
+const globalPersona = await failure(bare.plugin(Persona, { prefix: '全局人设' }))
+assert.match(globalPersona.message, /deployment:persona-prefix/)
+log(`dsh-persona 挂到全局层 -> ${globalPersona.message.split('\n')[0]}`)
 
 log('\n== 3. 想把宿主工具挡在值班 preset 外面 ==')
 const idle = (agent: Agent) => new Promise<void>((resolve, reject) => {
@@ -255,6 +271,25 @@ const lockedSwitch = await failure(ctx.agentPresets.select(s1, 'general'))
 assert.equal(lockedSwitch.code, 'agent-preset/locked')
 assert.equal(ctx.agentPresets.composedPreset(s1.ctx), 'release-oncall')
 log(`s1 已经跑过一轮，再切 -> ${lockedSwitch.code}：${lockedSwitch.message}`)
+const selectedOf = (agent: Agent) => agent.session.snapshotEvents().filter(e => e.type === 'agent-preset/selected').length
+const pinned = await open('s11', undefined, { allow: ['read_notes'] })
+assert.equal(tools(pinned), 'read_notes')
+await ctx.agentPresets.select(pinned, 'release-oncall')
+assert.equal(tools(pinned), '(空)')
+log(`s11 在 setup 里 allow [read_notes]，切到 release-oncall -> ${tools(pinned)}`)
+const redo = pinned.ctx.tools.restrict({ allow: ['lookup_release', 'rollback_release'] })
+assert.equal(tools(pinned), '(空)')
+log(`  不撤旧的，再下 allow [lookup_release, rollback_release] -> ${tools(pinned)}`)
+masks.get('s11')!()
+assert.equal(tools(pinned), 'lookup_release, rollback_release')
+log(`  撤掉旧的 allow -> ${tools(pinned)}`)
+redo()
+const blank2 = await open('s12')
+const badSwitch = await failure(ctx.agentPresets.select(blank2, 'oncall-own'))
+assert.equal(badSwitch.code, 'agent-preset/invalid')
+assert.equal(selectedOf(blank2), 0)
+assert.equal(ctx.agentPresets.composedPreset(blank2.ctx), 'general')
+log(`空会话 s12 切到 oncall-own -> ${badSwitch.code}，日志里 agent-preset/selected ${selectedOf(blank2)} 条，仍在 general`)
 
 log('\n== 5. 改 preset 目录里的文件 ==')
 const runbookOf = async (agent: Agent) => (await ctx.systemPrompt.assemble(assembleContextFor(agent)))
@@ -272,3 +307,39 @@ assert.equal(mounts('release-oncall'), 2)
 log(`再 touch agent.cordis.yml，新会话 ${afterTouch.id} 看到：${await runbookOf(afterTouch)}`)
 log(`  s1 仍是：${await runbookOf(s1)}（常驻挂载变成 ${mounts('release-oncall')} 份，旧的一份不回收）`)
 
+// 数两层文件监听：dsh-skill-filesystem 开的 chokidar 监听器，和进程里的原生 fs.watch 句柄。
+const handles = () => process.getActiveResourcesInfo().filter(r => r === 'FSEventWrap' || r === 'StatWatcher').length
+const chokidarPath = createRequire(fileURLToPath(new URL('../../packages/skill/skill-filesystem/package.json', import.meta.url))).resolve('chokidar')
+const chokidar = (await import(chokidarPath)).default as { watch: (...args: unknown[]) => { close(): Promise<void> } }
+let liveWatchers = 0
+const realWatch = chokidar.watch
+chokidar.watch = (...args: unknown[]) => {
+  const watcher = realWatch(...args)
+  const close = watcher.close.bind(watcher)
+  liveWatchers += 1
+  watcher.close = () => { liveWatchers -= 1; return close() }
+  return watcher
+}
+const skillsYml = join(presets, 'oncall-skills', 'agent.cordis.yml')
+await mkdir(join(presets, 'oncall-skills', 'skills'), { recursive: true })
+await put('oncall-skills/agent.cordis.yml', [
+  '- id: skills',
+  "  name: '@deepseek-ai/dsh-skill-filesystem'",
+  '  config:',
+  '    includeDefaultRoots: false',
+  `    customSkillDirs: [${join(presets, 'oncall-skills', 'skills')}]`,
+].join('\n'))
+const k1 = await open('k1', 'oncall-skills')
+await ctx.skills.list({ scope: k1 })
+const gen1 = [liveWatchers, handles()]
+await utimes(skillsYml, new Date(), new Date(Date.now() + 60_000))
+const k2 = await open('k2', 'oncall-skills')
+await ctx.skills.list({ scope: k2 })
+const gen2 = [liveWatchers, handles()]
+assert.equal(mounts('oncall-skills'), 2)
+assert.deepEqual([gen1, gen2], [[1, 1], [2, 1]])
+log('带 dsh-skill-filesystem 的 preset，每代各建一个会话并读一次 skill 目录：')
+log(`  第一代：chokidar 监听器 ${gen1[0]} 个，原生 fs.watch 句柄 ${gen1[1]} 个`)
+log(`  touch 后第二代：chokidar 监听器 ${gen2[0]} 个，原生 fs.watch 句柄 ${gen2[1]} 个`)
+// chokidar 监听器是常驻的，不退出进程会一直挂着。
+process.exit(0)

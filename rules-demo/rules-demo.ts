@@ -1,7 +1,11 @@
 /** Drive the release-rules engine through a scripted agent: block a third retry, warn on lookup, and probe its limits. */
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
-import LlmRuntime, { LlmAdapter, ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { HarnessError, LlmAdapter, ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmResolvedModelInfo, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
@@ -9,7 +13,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool, type ToolGuard } from '@deepseek-ai/dsh-tools'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
-import { ReleaseRules, failedTwiceIn24h, lastReleaseFailed, rulePlugin, type Config } from './release-rules.ts'
+import { ReleaseRules, failedTwiceIn24h, lastReleaseFailed, rulePlugin, type Config, type ReleaseRule } from './release-rules.ts'
 
 const log = (msg: string) => { console.log(msg) }
 
@@ -126,15 +130,16 @@ const deploy = (version: string) => call('deploy_release', { service: 'payment-a
 
 log('== 1. 同一版本部署失败两次，第三次被规则拦下 ==')
 const host = await boot()
-let denied: { message: string; info?: unknown } | undefined
+const errorsOf = new Map<string, { message: string; info?: unknown }>()
 host.ctx.on('tools/result', (exec, result) => {
-  if (exec.name === 'deploy_release' && result.isError) denied = { ...result.error }
+  if (result.isError) errorsOf.set(exec.name, { ...result.error })
   return undefined
 })
 await ask(host, '把 payment-api 2.3 发上去，失败就重试', deploy('2.3'), deploy('2.3'), deploy('2.3'), reply('停止重试。'))
 for (const [i, r] of results(host.agent, 3).entries()) {
   log(`第 ${i + 1} 次 deploy_release -> ${r.isError ? `isError=true\n  ${r.text}` : r.text}`)
 }
+const denied = errorsOf.get('deploy_release')
 log(`平台实际执行了 ${platform.length} 次；规则引擎记下的历史 ${host.ctx.releaseRules.history().length} 条`)
 log(`被拒调用的结果里带错误码吗：${denied?.info === undefined ? '没有，只有 message' : '有'}`)
 assert.deepEqual(results(host.agent, 3), [
@@ -145,9 +150,40 @@ assert.deepEqual(results(host.agent, 3), [
 assert.equal(platform.length, 2)
 assert.equal(host.ctx.releaseRules.history().length, 2)
 assert.equal(denied?.info, undefined)
+// 对照：工具体自己抛错时，结果里的 error 长什么样。
+const stringOutput = { schema: { type: 'string' }, render: (_args: unknown, value: string) => [{ type: 'text' as const, text: value }] } as const
+host.ctx.tools.register(defineTool({ name: 'throw_plain', description: 'Throw a plain Error.', parameters: {}, output: stringOutput, execute(): Promise<string> { throw new Error('platform down') } }))
+host.ctx.tools.register(defineTool({ name: 'throw_harness', description: 'Throw a HarnessError.', parameters: {}, output: stringOutput, execute(): Promise<string> { throw new HarnessError('platform down', 'PLATFORM_DOWN') } }))
+await ask(host, '试两个会抛错的工具', call('throw_plain', {}), call('throw_harness', {}), reply('都抛错了。'))
+log(`工具体抛普通 Error：${JSON.stringify(errorsOf.get('throw_plain'))}`)
+log(`工具体抛 HarnessError：${JSON.stringify(errorsOf.get('throw_harness'))}`)
+assert.deepEqual(errorsOf.get('throw_plain'), { message: 'platform down' })
+assert.deepEqual(errorsOf.get('throw_harness'), { message: 'platform down', info: { name: 'HarnessError', code: 'PLATFORM_DOWN' } })
 
 log('')
-log('== 2. 查询时追加告警：工具结果后面多一条插件消息 ==')
+log('== 2. 把被拒的调用也记成失败：窗口被一直续上 ==')
+let variantNow = now
+const variant = await boot({ now: () => variantNow, recordErrors: true })
+const deployRefund = () => call('deploy_release', { service: 'refund-api', version: '2.3' })
+const refundRuns = () => platform.filter(d => d.service === 'refund-api').length
+await ask(variant, '把 refund-api 2.3 发上去，失败就重试', deployRefund(), deployRefund(), deployRefund(), reply('停止重试。'))
+log(`第 0 小时：三次调用，平台执行 ${refundRuns()} 次，历史 ${variant.ctx.releaseRules.history().length} 条`)
+variantNow += 23 * HOUR
+await ask(variant, '过了 23 小时，再试', deployRefund(), deployRefund(), reply('还是被拦。'))
+const at23 = results(variant.agent, 2).map(r => r.isError)
+log(`第 23 小时：再试两次，被拒 ${at23.filter(Boolean).length} 次，历史 ${variant.ctx.releaseRules.history().length} 条`)
+variantNow += 2 * HOUR
+await ask(variant, '过了 25 小时，再试', deployRefund(), reply('还是被拦。'))
+const at25 = results(variant.agent, 1)[0]
+log(`第 25 小时：${at25?.text}`)
+log(`平台一共执行 ${refundRuns()} 次`)
+assert.equal(refundRuns(), 2)
+assert.deepEqual(at23, [true, true])
+assert.equal(variant.ctx.releaseRules.history().length, 6)
+assert.match(at25?.text ?? '', /^Error: \[same-version-failed-twice\] refund-api 2\.3 在 24 小时内已失败 2 次/)
+
+log('')
+log('== 3. 查询时追加告警：工具结果后面多一条插件消息 ==')
 await ask(host, 'payment-api 现在什么情况', call('lookup_release', { service: 'payment-api' }), reply('最近一次发布失败了。'))
 const seen = host.model.requests.at(-1) ?? []
 for (const m of seen.slice(-2)) log(`  ${m.role}/${m.source.kind}: ${textOf(m)}`)
@@ -161,51 +197,95 @@ assert.deepEqual(seen.slice(-2).map(m => [m.role, m.source.kind, textOf(m)]), [
 assert.deepEqual(alertEvent.data.source, { kind: 'plugin', plugin: 'release-rules' })
 
 log('')
-log('== 3. 版本写成 v2.3：规则没认出来，平台照样部署 ==')
+log('== 4. 版本写成 v2.3：规则没认出来，平台照样部署 ==')
+const runsBeforeV = platform.length
 await ask(host, '那试试 v2.3', deploy('v2.3'), reply('又失败了。'))
-log(`deploy_release(v2.3) -> ${results(host.agent, 1)[0]?.text}；平台执行次数 ${platform.length}`)
+log(`deploy_release(v2.3) -> ${results(host.agent, 1)[0]?.text}；平台执行次数 +${platform.length - runsBeforeV}`)
 const normalized = await boot({ normalize: (service, version) => ({ service: service.trim(), version: version.replace(/^v/i, '') }) })
 await ask(normalized, '把 payment-api 2.3 发上去', deploy('2.3'), deploy('v2.3'), deploy('v2.3'), reply('停了。'))
 log(`引擎按工具体同样的写法规范化后，2.3、v2.3、v2.3 三次：第 3 次被拦`)
 log(`  ${results(normalized.agent, 1)[0]?.text}`)
 assert.equal(results(host.agent, 1)[0]?.text, 'payment-api 2.3 failed')
-assert.equal(platform.length, 5)
+assert.equal(platform.length - runsBeforeV, 3)
 assert.match(results(normalized.agent, 1)[0]?.text ?? '', /^Error: \[same-version-failed-twice\] payment-api 2\.3 在 24 小时内已失败 2 次/)
 
 log('')
-log('== 4. 卸载规则、重载引擎 ==')
+log('== 5. 卸载规则、重载引擎 ==')
 const again = () => deploy('2.3')
+const lookup = () => call('lookup_release', { service: 'payment-api' })
+/** Plugin messages the model saw right after the last tool result, i.e. alerts attached to the latest lookup. */
+const alerts = () => {
+  const seenNow = host.model.requests.at(-1) ?? []
+  return seenNow.slice(seenNow.findLastIndex(isToolResult) + 1).filter(m => m.source.kind === 'plugin').map(textOf)
+}
 const ruleStates = () => host.rules.map(r => r.state)
 const ruleFiber = host.ctx.plugin(rulePlugin({ ...failedTwiceIn24h, id: 'hot-rule' }))
 await ruleFiber
-log(`已注册的规则：${host.ctx.releaseRules.list().join(', ')}`)
+const withHot = host.ctx.releaseRules.list()
+log(`已注册的规则：${withHot.join(', ')}`)
 await ruleFiber.dispose()
-log(`卸载 hot-rule 之后：${host.ctx.releaseRules.list().join(', ')}`)
+const withoutHot = host.ctx.releaseRules.list()
+log(`卸载 hot-rule 之后：${withoutHot.join(', ')}`)
 const before = host.ctx.releaseRules.evaluate('payment-api', '2.3').filter(f => f.severity === 'block').map(f => f.ruleId)
 log(`重载前，引擎对 payment-api 2.3 的判断：${before.join(', ')}`)
+const oldEngine = host.ctx.releaseRules
+const oldHistory = oldEngine.history().length
 await host.engine.dispose()
 const pending = ruleStates()
 log(`引擎卸载后，两条规则插件的状态：${pending.join(', ')}（0 = 等待依赖）`)
+// 往已卸载的旧实例上直接塞一条必拦规则和一条必告警规则：它的守卫和监听器若还在，就会生效。
+const staleBlock: ReleaseRule = { id: 'stale-block', severity: 'block', evaluate: () => '旧实例拦截' }
+const staleWarn: ReleaseRule = { id: 'stale-warn', severity: 'warn', evaluate: () => '旧实例告警' }
+oldEngine.register(staleBlock)
+oldEngine.register(staleWarn)
+const runsBeforeGap = platform.length
+await ask(host, '引擎不在，发 2.3 再查一下', again(), lookup(), reply('发了。'))
+const [gapDeploy] = results(host.agent, 2)
+const gapAlerts = alerts().length
+const gapRuns = platform.length - runsBeforeGap
+log(`卸载期间（旧实例上挂着必拦、必告警规则）：deploy_release(2.3) -> ${gapDeploy?.text}，平台执行 +${gapRuns}，查询告警 ${gapAlerts} 条，旧实例历史 ${oldEngine.history().length} 条（卸载前 ${oldHistory}）`)
 const reloaded = host.ctx.plugin(ReleaseRules, { now: () => now })
 await reloaded
 await new Promise(resolve => setTimeout(resolve, 10))
-log(`引擎重新加载：规则自动回来了 ${host.ctx.releaseRules.list().join(', ')}，历史 ${host.ctx.releaseRules.history().length} 条`)
+const reloadedHistory = host.ctx.releaseRules.history().length
+log(`引擎重新加载：规则自动回来了 ${host.ctx.releaseRules.list().join(', ')}，历史 ${reloadedHistory} 条`)
+await ask(host, '查一下 payment-api', lookup(), reply('查了。'))
+const alertsAfterReload = alerts().length
+log(`重载后先查询：告警 ${alertsAfterReload} 条`)
 await ask(host, '再发一次 2.3', again(), reply('发了。'))
 log(`deploy_release(2.3) -> ${results(host.agent, 1)[0]?.text}（重载前会被拦下，现在规则没有触发）`)
+await ask(host, '再查一下 payment-api', lookup(), reply('查了。'))
+const alertsAfterDeploy = alerts()
+log(`部署失败一次后再查询：告警 ${alertsAfterDeploy.length} 条 ${alertsAfterDeploy.join(' | ')}`)
+const restarted = await boot()
+const restartedHistory = restarted.ctx.releaseRules.history().length
+await ask(restarted, '发 payment-api 2.3', again(), reply('发了。'))
+log(`新宿主（相当于进程重启）：部署前历史 ${restartedHistory} 条，deploy_release(2.3) -> ${results(restarted.agent, 1)[0]?.text}`)
+assert.deepEqual(withHot, ['same-version-failed-twice', 'last-release-failed', 'hot-rule'])
+assert.deepEqual(withoutHot, ['same-version-failed-twice', 'last-release-failed'])
 assert.deepEqual(before, ['same-version-failed-twice'])
 assert.deepEqual(pending, [0, 0])
+assert.equal(reloadedHistory, 0)
+assert.deepEqual(gapDeploy, { text: 'payment-api 2.3 failed', isError: false })
+assert.equal(gapRuns, 1)
+assert.equal(gapAlerts, 0)
+assert.equal(oldEngine.history().length, oldHistory)
 assert.deepEqual(host.ctx.releaseRules.list(), ['same-version-failed-twice', 'last-release-failed'])
-assert.equal(results(host.agent, 1)[0]?.text, 'payment-api 2.3 failed')
+assert.equal(alertsAfterReload, 0)
+assert.equal(results(host.agent, 2)[0]?.text, 'payment-api 2.3 failed')
+assert.deepEqual(alertsAfterDeploy, ['release-rules 告警：[last-release-failed] payment-api 最近一次发布 2.3 失败'])
+assert.equal(restartedHistory, 0)
+assert.equal(results(restarted.agent, 1)[0]?.text, 'payment-api 2.3 failed')
 
 log('')
-log('== 5. 24 小时窗口：时钟拨快 25 小时后放行 ==')
+log('== 6. 24 小时窗口：时钟拨快 25 小时后放行 ==')
 now += 25 * HOUR
 await ask(normalized, '过了一天，再试一次', deploy('2.3'), reply('还是失败。'))
 log(`deploy_release(2.3) -> ${results(normalized.agent, 1)[0]?.text}（25 小时前的 2 次失败都已出了窗口）`)
 assert.equal(results(normalized.agent, 1)[0]?.text, 'payment-api 2.3 failed')
 
 log('')
-log('== 6. 守卫写成 async ==')
+log('== 7. 守卫写成 async ==')
 const asyncGuard = (async () => undefined) as unknown as ToolGuard
 const disposeGuard = host.ctx.tools.guard(asyncGuard)
 const deploysBefore = platform.length
@@ -221,3 +301,29 @@ log(`去掉这个守卫后 lookup_release(order-api) -> ${results(host.agent, 1)
 assert.deepEqual([lookupAsync, deployAsync], Array.from({ length: 2 }, () => ({ text: 'Error: tool result must be losslessly JSON-serializable', isError: true })))
 assert.equal(platform.length, deploysBefore)
 assert.deepEqual(results(host.agent, 1)[0], { text: 'order-api: no deployment', isError: false })
+
+log('')
+log('== 8. 去掉强转，让 tsc 检查 async 守卫 ==')
+const probeDir = join(dirname(fileURLToPath(import.meta.url)), `.tsc-probe-${process.pid}`)
+const probe = (guard: string) => [
+  `import type { Context } from '@deepseek-ai/cordis'`,
+  `import type {} from '@deepseek-ai/dsh-tools'`,
+  `declare const ctx: Context`,
+  `ctx.tools.guard(${guard})`,
+  '',
+].join('\n')
+mkdirSync(probeDir, { recursive: true })
+let tscLines: string[]
+try {
+  writeFileSync(join(probeDir, 'async-guard.ts'), probe('async () => undefined'))
+  writeFileSync(join(probeDir, 'sync-guard.ts'), probe('() => undefined'))
+  writeFileSync(join(probeDir, 'tsconfig.json'), JSON.stringify({ extends: '../../tsconfig.json', include: ['*.ts'] }))
+  const tsc = spawnSync(join(probeDir, '../../../node_modules/.bin/tsc'), ['--noEmit', '-p', join(probeDir, 'tsconfig.json')], { cwd: probeDir, encoding: 'utf8' })
+  // vendor 源码本身在 strict 配置下有报错，只看两个探针文件自己的诊断。
+  tscLines = tsc.stdout.split('\n').filter(line => /^(async|sync)-guard\.ts\(/.test(line))
+} finally {
+  rmSync(probeDir, { recursive: true, force: true })
+}
+for (const line of tscLines) log(line)
+log(`sync-guard.ts 的报错：${tscLines.filter(line => line.startsWith('sync-')).length} 条`)
+assert.deepEqual(tscLines, ["async-guard.ts(4,29): error TS2322: Type 'Promise<undefined>' is not assignable to type 'string'."])

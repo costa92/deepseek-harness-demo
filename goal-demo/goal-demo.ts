@@ -1,12 +1,13 @@
 /** Drive a "patrol every service's latest release" goal through dsh-goal, dsh-tool-goal and the round driver. */
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, { LlmAdapter, ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmResolvedModelInfo, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId, SessionLogOffset, type SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
@@ -96,11 +97,13 @@ const lookupRelease = defineTool({
 })
 
 // ── 宿主 ───────────────────────────────────────────────────────────────
-const root = mkdtempSync(join(tmpdir(), 'dsh-goal-demo-'))
-process.on('exit', () => { rmSync(root, { recursive: true, force: true }) })
+// 第 5 步会用同一个脚本起一个子进程（设了 GOAL_DEMO_CHILD_ROOT），在里面跑到一半被 SIGKILL。
+const childRoot = process.env.GOAL_DEMO_CHILD_ROOT
+const root = childRoot ?? mkdtempSync(join(tmpdir(), 'dsh-goal-demo-'))
+if (childRoot === undefined) process.on('exit', () => { rmSync(root, { recursive: true, force: true }) })
 const agentOptions = { provider: 'mock', model: 'mock' }
 
-async function boot(): Promise<{ ctx: Context; model: ScriptedModel }> {
+async function boot(checkpoint = true): Promise<{ ctx: Context; model: ScriptedModel }> {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
@@ -110,7 +113,7 @@ async function boot(): Promise<{ ctx: Context; model: ScriptedModel }> {
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(JsonlSessionPersistence, { root, compression: 'none' })
   // 和默认 base bundle 一样：模型请求前把日志刷到盘上。
-  await ctx.plugin(CheckpointPolicy)
+  if (checkpoint) await ctx.plugin(CheckpointPolicy)
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(GoalService)
   await ctx.plugin(ToolGoal)
@@ -120,7 +123,7 @@ async function boot(): Promise<{ ctx: Context; model: ScriptedModel }> {
   ctx.tools.register(lookupRelease)
   return { ctx, model }
 }
-let { ctx, model } = await boot()
+let { ctx, model } = await boot(childRoot === undefined)
 
 const human = (text: string) => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
 /** Wait until the agent is idle and `done` holds; fail instead of hanging. */
@@ -169,6 +172,24 @@ const lookupTurn = (i: number): Action[] => [
   call('lookup_release', () => ({ service: SERVICES[i] })),
   reply(`第 ${i + 1} 个服务查完。`),
 ]
+const pluginMessage = (text: string) => createUserMessage({
+  content: [{ type: 'text', text }],
+  source: { kind: 'plugin', plugin: 'demo', form: 'notice', summary: text },
+})
+
+if (childRoot !== undefined) {
+  // 子进程：不挂 checkpoint 插件，卡在第 2 轮查 payment-api 时告诉父进程，然后等着被杀。
+  const killed = (await ctx.agents.create({ sessionId: SessionId('killed'), agentOptions })).agent
+  model.turns.push(createTurn(8), lookupTurn(0), [call('lookup_release', () => ({ service: SERVICES[1] }))])
+  hang = async () => {
+    if (looked.length < 2) return
+    console.log(`HANG ${brief(killed)}`)
+    await new Promise(() => {})
+  }
+  killed.followup(human('巡检一下所有服务最近一次发布'))
+  setInterval(() => {}, 1_000)
+  await new Promise(() => {})
+}
 
 log('== 1. 巡检：一条人类消息，之后自动续跑 ==')
 const patrol = (await ctx.agents.create({ sessionId: SessionId('patrol'), agentOptions })).agent
@@ -208,6 +229,38 @@ assert.ok(noticeText.startsWith('<goal_complete>'))
 assert.equal(notice.data.source.kind === 'plugin' ? notice.data.source.plugin : '', 'tool-goal')
 log('complete 之后，tool-goal 给模型追加一条收尾提示：')
 log(`  ${noticeText.split('\n')[2]!.split('. ')[0]}.`)
+// 另一会话：驱动器刚把第 1 轮排进收件箱，同一拍里插进一条插件消息。
+const cutin = (await ctx.agents.create({ sessionId: SessionId('cutin'), agentOptions })).agent
+const queuedRounds: number[] = []
+let cutDone = false
+ctx.on('agent/inbox/inserted', ({ agent, message }) => {
+  if (agent !== cutin || message.source.kind !== 'goal') return
+  queuedRounds.push(message.source.round)
+  if (cutDone) return
+  cutDone = true
+  cutin.followup(pluginMessage('插话：先看一眼告警'))
+})
+const claimed: string[] = []
+ctx.on('agent/inbox/claimed', ({ agent, message }) => {
+  if (agent === cutin) claimed.push(message.source.kind === 'goal' ? `goal round ${message.source.round}` : message.source.kind)
+})
+model.turns.push(
+  createTurn(8),
+  [reply('告警看过了。')],
+  [call('get_goal', () => ({})), update('complete'), reply('巡检完成。')],
+)
+cutin.followup(human('巡检一下所有服务最近一次发布'))
+await settle(cutin, () => ctx.goals.get(cutin)?.phase === 'complete')
+const cutinOrder = events(cutin).flatMap(e => e.type === 'user/message'
+  ? [e.data.source.kind === 'goal' ? `goal round ${e.data.source.round}` : e.data.source.kind] : [])
+assert.deepEqual(queuedRounds, [1, 1])
+assert.deepEqual(claimed, ['user', 'goal round 1', 'plugin', 'goal round 1', 'plugin'])
+assert.deepEqual(cutinOrder, ['user', 'plugin', 'goal round 1', 'plugin'])
+assert.equal(brief(cutin), 'phase=complete rounds=1/8 activation=disarmed')
+log('另一会话：驱动器排进第 1 轮的同时，插进一条插件消息')
+log(`  第 1 轮 goal 消息排队 ${queuedRounds.length} 次，领取顺序：${claimed.join(', ')}`)
+log(`  日志里的消息：${cutinOrder.join(', ')}`)
+log(`  结束：${brief(cutin)}`)
 
 log('\n== 2. 只查了 2 个服务就宣布完成 ==')
 looked.length = 0
@@ -264,6 +317,18 @@ assert.equal(toolResults(quiet, 'update_goal').length, 1)
 assert.equal(brief(quiet), 'phase=blocked rounds=3/8 activation=disarmed reason=model-reported')
 log('另一会话前两轮都不报，第 3 轮第一次报 -> 接受')
 log(`  ${brief(quiet)}`)
+const told = (await ctx.agents.create({ sessionId: SessionId('told'), agentOptions })).agent
+model.turns.push([
+  call('create_goal', () => ({ objective: OBJECTIVE, max_goal_rounds: 8 })),
+  call('get_goal', () => ({})),
+  update('blocked', blockedReason),
+  reply('按你说的，标记为受阻。'),
+])
+told.followup(human('巡检一下所有服务最近一次发布；记录服务在维护，先标记受阻'))
+await settle(told, () => ctx.goals.get(told)?.phase === 'blocked')
+assert.equal(brief(told), 'phase=blocked rounds=0/8 activation=disarmed reason=model-reported')
+assert.deepEqual(goalRounds(told), [])
+log(`人类那一轮直接要求标记受阻 -> 接受：${brief(told)}`)
 
 log('\n== 4. 模型一直不收尾：轮数上限 ==')
 const endless = (await ctx.agents.create({ sessionId: SessionId('endless'), agentOptions })).agent
@@ -301,6 +366,23 @@ const roundOnDisk = (n: number) => new RegExp(`"kind":"goal"[^}]*"round":${n}`).
 assert.ok(roundOnDisk(1) && roundOnDisk(2))
 log(`卡在第 2 轮查 ${looked.at(-1)}：${brief(crash)}`)
 log('  此时盘上的日志已有第 1、2 轮的 goal 消息（checkpoint 插件在模型请求前刷了盘）')
+// 按 session-controller 的 fork 写法：取到最后一个完整轮次为止的日志当种子。
+const parentEvents = events(crash)
+const cut = parentEvents.findLastIndex(e => e.type === 'turn/end') + 1
+const forked = (await ctx.agents.create({
+  sessionId: SessionId('forked'),
+  seed: parentEvents.slice(0, cut),
+  inheritedEventCount: SessionLogOffset(cut),
+  meta: { parentSession: crash.session.id, isSeeded: true },
+  agentOptions,
+})).agent
+model.turns.push([reply('收到。')])
+forked.followup(pluginMessage('巡检提醒：还有服务没查'))
+await settle(forked, () => turnCount(forked) > parentEvents.slice(0, cut).filter(e => e.type === 'turn/end').length)
+assert.equal(brief(forked), 'phase=active rounds=1/8 activation=disarmed')
+assert.deepEqual(goalRounds(forked), [1])
+log(`从第 1 轮结束处 fork：${brief(forked)}`)
+log(`  插件消息让 fork 跑完一轮再空闲：goal round 仍是 ${goalRounds(forked).join(',')}`)
 await ctx.fiber.dispose()
 ;({ ctx, model } = await boot())
 const resumed = (await ctx.agents.resume({ resumeSessionId: SessionId('crash'), agentOptions })).agent
@@ -311,12 +393,12 @@ assert.match(interrupted, /^The tool call was interrupted/)
 log('  第 2 轮的 lookup_release 结果被补写为：')
 log(`    ${interrupted.split('. ')[0]}.`)
 // 恢复出来的 agent 直接是 idle，不会触发驱动器；用一条插件消息让它跑完一轮再空闲。
-model.turns.push([reply('收到。')])
-resumed.followup(createUserMessage({
-  content: [{ type: 'text', text: '巡检提醒：还有服务没查' }],
-  source: { kind: 'plugin', plugin: 'demo', form: 'notice', summary: '巡检提醒' },
-}))
-await settle(resumed, () => model.requests === 1)
+model.turns.push([call('get_goal', () => ({})), update('resume'), reply('收到。')])
+resumed.followup(pluginMessage('巡检提醒：还有服务没查'))
+await settle(resumed, () => model.requests === 3)
+const resumeTry = toolResults(resumed, 'update_goal')
+assert.deepEqual(resumeTry, ['Error: this goal operation requires a direct human turn on a top-level agent'])
+log(`插件消息那一轮，模型 update_goal resume -> ${resumeTry[0]}`)
 assert.deepEqual(goalRounds(resumed), [1, 2])
 assert.equal(brief(resumed), 'phase=active rounds=2/8 activation=disarmed')
 log(`插件消息让 agent 跑完一轮再空闲：模型请求 ${model.requests} 次，goal round 仍是 ${goalRounds(resumed).join(',')}`)
@@ -337,5 +419,30 @@ assert.equal(brief(resumed), 'phase=complete rounds=6/8 activation=disarmed')
 assert.deepEqual(looked, ['order-api', 'payment-api', 'payment-api', 'user-api', 'search-api', 'notify-api'])
 log(`人类说“继续”，模型 update_goal resume 之后：goal round ${goalRounds(resumed).join(',')}`)
 log(`  结束：${brief(resumed)}；被中断的第 2 轮计入轮数`)
+// 子进程不挂 checkpoint 插件，卡在第 2 轮时被 SIGKILL，再在本进程恢复。
+const child = spawn(process.execPath, [...process.execArgv, process.argv[1]!], {
+  env: { ...process.env, GOAL_DEMO_CHILD_ROOT: root },
+  stdio: ['ignore', 'pipe', 'inherit'],
+})
+const hungLine = await new Promise<string>((resolve, reject) => {
+  const timer = setTimeout(() => { reject(new Error('child did not reach round 2')) }, 20_000)
+  let buffer = ''
+  child.stdout.on('data', (chunk: Buffer) => {
+    buffer += chunk.toString()
+    const line = buffer.split('\n').find(l => l.startsWith('HANG '))
+    if (line !== undefined) { clearTimeout(timer); resolve(line.slice(5)) }
+  })
+})
+const exited = new Promise<NodeJS.Signals | null>((resolve) => { child.on('exit', (_code, signal) => { resolve(signal) }) })
+child.kill('SIGKILL')
+const signal = await exited
+const killedAgent = (await ctx.agents.resume({ resumeSessionId: SessionId('killed'), agentOptions })).agent
+assert.equal(hungLine, 'phase=active rounds=2/8 activation=armed')
+assert.equal(signal, 'SIGKILL')
+assert.equal(brief(killedAgent), 'phase=active rounds=1/8 activation=disarmed')
+assert.deepEqual(goalRounds(killedAgent), [1])
+assert.deepEqual(toolResults(killedAgent, 'lookup_release'), ['order-api: demo-007 succeeded'])
+log(`子进程不挂 checkpoint 插件，卡在第 2 轮时：${hungLine}`)
+log(`  ${signal} 后在本进程恢复：${brief(killedAgent)}，日志里只有第 1 轮`)
 
 await ctx.fiber.dispose()

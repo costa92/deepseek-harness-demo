@@ -4,7 +4,8 @@
 
 在一条发布查询链路上跑完 Cordis 的五种分发模式：waterfall 的洋葱序与否决、
 bail 的中止判定、emit 吞返回值、parallel 聚合错误、serial 串行短路，
-最后卸载脱敏插件，验证监听器随插件消失。
+卸载脱敏插件，验证监听器随插件消失；另外验证监听器抛错时 serial / bail / waterfall 的表现、没人 bail 与中间件返回 undefined、
+`isBailed` 的边界值、emit 遇到异步监听器 reject，最后销毁根上下文。
 
 ## 运行
 
@@ -17,7 +18,7 @@ cp -R scratch-plugin/deepseek-harness-demo/events-demo scratch-plugin/events-dem
 node --import tsx/esm scratch-plugin/events-demo/events-demo.ts
 ```
 
-文章发布时的代码保留在 `cordis-events` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
+文章首次发布时的代码保留在 `cordis-events` 分支；2026-09-30 补测后，`master` 上的本目录新增了步骤与断言，与该分支不同。
 
 脚本带断言，行为与文章不符时以非零退出码结束。
 

@@ -5,6 +5,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool, type PreToolDecision, type PostToolDecision } from '@deepseek-ai/dsh-tools'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import * as timeoutPolicy from '@deepseek-ai/dsh-tool-call-timeout-policy'
+import { createScope } from '@deepseek-ai/dsh-scope'
 
 const log = (msg: string) => { console.log(msg) }
 const root = new Context()
@@ -28,6 +29,7 @@ const records = [
 ]
 let bodyDelayMs = 0
 let ignoreSignal = false
+let bodyThrows = false
 const trace: string[] = []
 root.tools.register(defineTool({
   name: 'lookup_release',
@@ -44,6 +46,7 @@ root.tools.register(defineTool({
   finalizeContent: () => { trace.push('finalizeContent'); return undefined },
   async execute(args, exec) {
     trace.push('body')
+    if (bodyThrows) throw new Error('release platform returned 502')
     if (bodyDelayMs) {
       await new Promise<void>((resolve, reject) => {
         const t = setTimeout(resolve, bodyDelayMs)
@@ -177,5 +180,139 @@ out = await run('pre-execute throws', { service: 'payment-api' })
 assert.equal(out.r.error?.message, 'policy service unreachable')
 assert.equal(out.stages, 'pre-execute -> finalizeContent -> result')
 buggy(); guard()
+
+// 以下各步需要指定工具名、调用方 agent 或 signal。
+const runWith = async (label: string, input: { name?: string; args?: unknown; agent?: object; signal?: AbortSignal }) => {
+  trace.length = 0
+  const r = await root.tools.execute({
+    callId: ToolCallId(`demo-${++seq}`), name: input.name ?? 'lookup_release', arguments: input.args ?? {},
+    signal: input.signal ?? new AbortController().signal,
+    ...input.agent ? { agent: input.agent as never } : {},
+  })
+  log(`  ${label}: ${brief(r)}`)
+  log(`    stages: ${trace.join(' -> ')}`)
+  return { r, stages: trace.join(' -> ') }
+}
+
+log('8. tools/execute: the contract says swap exec.signal only')
+// 第 3 步的全量查询守卫重新挂上。
+const guard8 = root.tools.guard(exec => exec.name === 'lookup_release' ? denyFullScan(exec.arguments) : undefined)
+let rewrite: 'mutate' | 'arguments' | 'name' = 'mutate'
+const rewriter = root.on('tools/execute', (exec, next) => {
+  const target = exec as { arguments: unknown; name: string }
+  if (rewrite === 'mutate') (target.arguments as { service: string }).service = 'order-api'
+  if (rewrite === 'arguments') target.arguments = {}
+  if (rewrite === 'name') target.name = 'no_such_tool'
+  return next()
+}, true)
+out = await run('mutate exec.arguments.service', { service: 'payment-api' })
+assert.match(out.r.error?.message ?? '', /Cannot assign to read only property 'service'/)
+assert.equal(out.stages, 'pre-execute -> guard -> finalizeContent -> result')
+// 契约说只能换 signal，但整体替换 arguments / name 并没有被拦住。
+rewrite = 'arguments'
+out = await run('guard passes payment-api, then reassign exec.arguments = {}', { service: 'payment-api' })
+assert.equal(textOf(out.r), '3 record(s): demo-001,demo-003,demo-007')
+rewrite = 'name'
+out = await run('reassign exec.name', { service: 'payment-api' })
+assert.equal(out.r.error?.info?.code, 'UNKNOWN_TOOL')
+rewriter(); guard8()
+
+log('9. guards along the scope chain: global first, then farthest scope first')
+const agentA = { id: 'agent-A' }
+const subA = { id: 'agent-A/sub' }
+let hostCtx!: Context
+await root.plugin({ name: 'agent-host', inject: ['tools'], apply(ctx: Context) { hostCtx = ctx } })
+const scopeA = createScope(hostCtx, agentA)
+const scopeSub = createScope(hostCtx, subA, { parent: agentA })
+const svc = (exec: { arguments: unknown }) => (exec.arguments as { service?: unknown } | undefined)?.service
+const guards = [
+  root.tools.guard(exec => svc(exec) === 'g' ? 'global guard' : undefined),
+  scopeA.ctx.tools.guard(exec => svc(exec) === 'g' || svc(exec) === 'a' ? 'agent-A guard' : undefined),
+  scopeSub.ctx.tools.guard(() => 'sub-agent guard'),
+]
+const guarded: string[] = []
+for (const [label, agent, service] of [
+  ['no agent, payment-api', undefined, 'payment-api'],
+  ['agent-A, payment-api', agentA, 'payment-api'],
+  ['agent-A/sub, payment-api', subA, 'payment-api'],
+  ['agent-A/sub, a', subA, 'a'],
+  ['agent-A/sub, g', subA, 'g'],
+] as const) {
+  out = await runWith(label, { args: { service }, agent })
+  guarded.push(out.r.isError ? out.r.error.message : 'ok')
+}
+assert.deepEqual(guarded, ['ok', 'ok', 'sub-agent guard', 'agent-A guard', 'global guard'])
+for (const off of guards) off()
+
+log('10. ask: default reason, no agent, and the four approval outcomes')
+let askReason: string | undefined
+const asker2 = root.on('tools/pre-execute', (exec, next): Promise<PreToolDecision> =>
+  exec.name === 'lookup_release' ? Promise.resolve(askReason === undefined ? { kind: 'ask' } : { kind: 'ask', reason: askReason }) : next())
+out = await runWith('ask without reason, no approval service', { args: { service: 'payment-api' } })
+assert.equal(out.r.error?.message, 'tool "lookup_release" requires approval (not yet supported)')
+let outcome = 'allowed-once'
+const approvalReasons: string[] = []
+// 审批服务的桩：按 outcome 回答，不走真实的 dsh-user-approval（它要求处于打开的回合里）。
+const offApproval = root.provide('approval', { request: async (req: { reason?: string }) => { approvalReasons.push(String(req.reason)); return outcome } })
+askReason = 'production payment data'
+out = await runWith('approval service, but no agent', { args: { service: 'payment-api' } })
+assert.equal(out.r.error?.message, 'tool "lookup_release" requires approval, but the call has no agent to route it through')
+assert.deepEqual(approvalReasons, [])
+const outcomes: string[] = []
+for (const o of ['allowed-once', 'rejected', 'cancelled', 'unavailable']) {
+  outcome = o
+  out = await runWith(`agent-A, approver says ${o}`, { args: { service: 'payment-api' }, agent: agentA })
+  outcomes.push(out.r.isError ? out.r.error.message : textOf(out.r))
+}
+assert.deepEqual(outcomes, [
+  '2 record(s): demo-001,demo-003',
+  'the user rejected tool "lookup_release"',
+  'approval for tool "lookup_release" was cancelled',
+  'tool "lookup_release" requires approval, but no approval channel is available',
+])
+assert.deepEqual(approvalReasons, Array(4).fill('production payment data'))
+asker2(); offApproval()
+await scopeSub.dispose()
+await scopeA.dispose()
+
+log('11. a value swapped in tools/execute is validated too')
+const swapper = root.on('tools/execute', async (_exec, next) => {
+  const r = await next()
+  return r.isError ? r : { ...r, value: { count: 'two', ids: [] } }
+})
+out = await run('around layer swaps the value', { service: 'payment-api' })
+assert.equal(out.r.error?.info?.code, 'INVALID_TOOL_OUTPUT')
+assert.ok(!out.stages.includes('post-execute'))
+swapper()
+
+log('12. tool failures still reach post-execute')
+bodyThrows = true
+out = await run('the body throws', { service: 'payment-api' })
+assert.equal(out.r.error?.message, 'release platform returned 502')
+assert.equal(out.stages, FULL)
+bodyThrows = false
+out = await runWith('unknown tool', { name: 'no_such_tool' })
+assert.equal(out.r.error?.info?.code, 'UNKNOWN_TOOL')
+assert.equal(out.stages, 'pre-execute -> guard -> execute> -> <execute -> post-execute -> result')
+
+log('13. caller cancellation: before dispatch, and after the body started')
+let abortIn: 'pre' | 'body' | undefined
+const caller = new AbortController()
+const aborter = root.on('tools/pre-execute', (_exec, next) => { if (abortIn === 'pre') caller.abort(); return next() })
+abortIn = 'pre'
+out = await runWith('caller aborts during pre-execute', { args: { service: 'payment-api' }, signal: caller.signal })
+assert.equal(out.r.error?.info?.code, 'ABORTED_BEFORE_DISPATCH')
+assert.ok(!out.stages.includes('body'))
+aborter()
+const caller2 = new AbortController()
+bodyDelayMs = 30
+ignoreSignal = true
+const bodyStarted = root.on('tools/execute', async (_exec, next) => { setTimeout(() => { caller2.abort() }, 5); return next() })
+out = await runWith('caller aborts while the body runs', { args: { service: 'payment-api' }, signal: caller2.signal })
+assert.equal(out.r.error?.info?.code, 'ABORTED')
+assert.ok(out.stages.includes('body'))
+bodyStarted()
+bodyDelayMs = 0
+ignoreSignal = false
 
 process.exit(0)

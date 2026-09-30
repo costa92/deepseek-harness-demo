@@ -22,6 +22,12 @@ class ScriptedModel extends LlmAdapter {
     const last = options.messages.findLast(m => m.source.kind === 'user' || m.source.kind === 'tool')
     const block = last?.content[0]
     if (block?.type === 'tool-result') {
+      // “空回复”任务：工具结果回来后只给一个空文字块，前一步的文字留在工具调用那条消息里。
+      const user = options.messages.findLast(m => m.source.kind === 'user')
+      if (user !== undefined && text(user).includes('空回复')) {
+        yield* this.reply('')
+        return
+      }
       const result = block.content.map(b => b.type === 'text' ? b.text : '').join('')
       yield* this.reply(block.isError === true ? `没有执行：${result}` : `已完成：${result}`)
       return
@@ -33,6 +39,10 @@ class ScriptedModel extends LlmAdapter {
     }
     const task = text(last)
     if (task.includes('模型故障')) throw new Error('scripted provider is down')
+    if (task.includes('空回复')) {
+      yield* this.toolCall('read_releases', { service: 'payment-api' }, '先查一下发布记录')
+      return
+    }
     const deploy = /部署 (\S+) (\S+)/.exec(task)
     if (deploy !== null) {
       yield* this.toolCall('deploy_release', { service: deploy[1], version: deploy[2] })
@@ -55,12 +65,17 @@ class ScriptedModel extends LlmAdapter {
     yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } }
     yield { type: 'finish', reason: { kind: 'stop' } }
   }
-  private * toolCall(tool: string, args: object): Iterable<StreamChunk> {
+  private * toolCall(tool: string, args: object, lead?: string): Iterable<StreamChunk> {
     const id = ToolCallId(`call-${++this.seq}`)
     const json = JSON.stringify(args)
-    yield { type: 'block-start', index: 0, blockType: 'tool-call' }
-    yield { type: 'tool-call-delta', index: 0, id, name: tool, argumentsDelta: json }
-    yield { type: 'block-end', index: 0, block: { type: 'tool-call', id, name: tool, arguments: json } }
+    const at = lead === undefined ? 0 : 1
+    if (lead !== undefined) {
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: lead } }
+    }
+    yield { type: 'block-start', index: at, blockType: 'tool-call' }
+    yield { type: 'tool-call-delta', index: at, id, name: tool, argumentsDelta: json }
+    yield { type: 'block-end', index: at, block: { type: 'tool-call', id, name: tool, arguments: json } }
     yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } }
     yield { type: 'finish', reason: { kind: 'tool-calls' } }
   }

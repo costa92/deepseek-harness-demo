@@ -1,11 +1,12 @@
 # agent-loop-demo
 
-配套文章《DeepSeek Harness 源码：一轮“查询 → 回答”走了两步，模型连调 25 次工具也没人拦》（系列第 16 篇）。
+配套文章《DeepSeek Harness 源码：模型连调 25 次工具，循环没有步数上限》（系列第 16 篇）。
 
-五步追踪 dsh 的 Agent Loop：给主要钩子挂上记录用的监听器，按顺序打印一次“查询 → 回答”经过的每个钩子和每条会话日志事件；
+十七步追踪 dsh 的 Agent Loop：给主要钩子挂上记录用的监听器，按顺序打印一次“查询 → 回答”经过的每个钩子和每条会话日志事件；
 核对第二次模型请求的消息与 `session.deriveMessages()` 一致且已冻结；工具执行中分别 `steer` 和 `followup`，看它们落在哪一轮哪一步；
 让模型连续调 25 次工具，确认循环没有步数上限、`agent/turn-stopping` 只在最后触发一次；最后对比三种停法：
 `agent/pre-step` 拒绝（被拒绝的步骤领走的 steer 消息会丢失）、在钩子里 `agent.cancel()`、工具里 `exec.concludeTurn()`。
+另外验证：`agent/request` 里取消时这一步不提交系统提示和用户消息；步间变化的提示在第 2 步重新提交；同一条消息里两个可并行的调用，慢的第一个仍先提交；`request/header` 只在信封变化时重写；排队的 followup 记在日志里，kill -9 后在新 Context 恢复；轮内压缩不结束本轮；输出截断以 max-tokens 结束；`agent/turn-stopping` 监听器 steer 能让本轮继续；有上下文或 steer 等着时 `concludeTurn()` 不结束本轮；拒绝第 4 步前先把领走的 steer 放回；流式输出中途和两个调用中第一个执行时取消；`cancel()` 默认清空排队消息，`keepInbox` 可保留。
 
 ## 运行
 
@@ -18,7 +19,7 @@ cp -R scratch-plugin/deepseek-harness-demo/agent-loop-demo scratch-plugin/agent-
 node --import tsx/esm scratch-plugin/agent-loop-demo/agent-loop-demo.ts
 ```
 
-文章发布时的代码保留在 `dsh-agent-loop` 分支，示例源码与 `master` 上的本目录相同，README 的运行方式有更新。
+文章首次发布时的代码保留在 `dsh-agent-loop` 分支；2026-09-30 补测后，`master` 上的本目录新增了步骤与断言，与该分支不同。
 
 模型是脚本里写死回复的假适配器，不需要 API key，也不调用真实模型；没有挂持久化，会话只在内存里，不写任何文件。
 发布数据是合成的。脚本每一步都带断言，行为与文章不符时以非零退出码结束。

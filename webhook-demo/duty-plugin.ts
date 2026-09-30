@@ -35,11 +35,21 @@ class ScriptedModel extends LlmAdapter {
     this.probe({
       type: 'model/request',
       messages: options.messages.filter(m => m.role !== 'system').map(m => ({ role: m.role, source: m.source.kind })),
+      catalogListsRunbook: options.messages.some(m => m.source.kind === 'skill-catalog' && text(m).includes('release-runbook')),
     })
     const block = last.content[0]
     if (block?.type === 'tool-result') {
       const result = block.content.map(b => b.type === 'text' ? b.text : '').join('')
       yield* this.reply(block.isError === true ? `没有执行：${result}` : `已完成：${result}`)
+      return
+    }
+    if (text(last).includes('加载 release-runbook')) {
+      yield* this.toolCall('skill', { name: 'release-runbook' })
+      return
+    }
+    const goal = /建目标 (\S+)/.exec(text(last))
+    if (goal !== null) {
+      yield* this.toolCall('create_goal', { objective: goal[1] })
       return
     }
     const deploy = /部署 (\S+) (\S+)/.exec(text(last))

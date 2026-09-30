@@ -1,16 +1,13 @@
-/** Read deploy outcomes back out of persisted session logs, and turn repeated failures into anomalies with evidence refs. */
+/** Read deploy outcomes back out of persisted session logs (the reader from part 23, without the anomaly finder). */
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-query'
-import type { RuleSpec } from './rule-store.ts'
 
 /** One deploy call as the log remembers it. */
 export interface DeployRecord {
   /** `<session id>#<seq>` of the tool/result event. */
   readonly ref: string
   readonly session: string
-  /** Tool call id shared by the tool/call event and the tool-result block. */
-  readonly callId: string
   /** Raw argument string of the matching tool/call event, as the model sent it. */
   readonly rawArguments: string
   /** executed: the platform ran it; denied: a rule rejected it; error: anything else that failed. */
@@ -53,7 +50,7 @@ export async function readDeploys(ctx: Context, tool = 'deploy_release'): Promis
       const meta = (data.meta ?? {}) as Meta
       const kind = block.isError !== true ? 'executed' : /^Error: \[[a-z0-9-]+@\d+\]/.test(text) ? 'denied' : 'error'
       records.push({
-        ref: `${session}#${event.seq}`, session, callId: block.toolCallId, rawArguments: call.arguments, kind, text,
+        ref: `${session}#${event.seq}`, session, rawArguments: call.arguments, kind, text,
         ...typeof meta.service === 'string' ? { service: meta.service } : {},
         ...typeof meta.version === 'string' ? { version: meta.version } : {},
         ...typeof meta.outcome === 'string' ? { outcome: meta.outcome } : {},
@@ -63,41 +60,4 @@ export async function readDeploys(ctx: Context, tool = 'deploy_release'): Promis
     }
   }
   return records
-}
-
-/** A release that kept failing although a rule was active. */
-export interface Anomaly {
-  readonly service: string
-  readonly version: string
-  readonly failures: number
-  readonly denials: number
-  readonly sessions: number
-  readonly spanHours: number
-  /** Refs of the executed-and-failed calls. */
-  readonly evidence: string[]
-}
-
-/**
- * Flag releases that failed more often than the active rule allows: the rule fired, yet the version kept being deployed.
- * @param records - deploy records from {@link readDeploys}.
- * @param active - the active rule spec the failures slipped past.
- */
-export function findAnomalies(records: readonly DeployRecord[], active: RuleSpec): Anomaly[] {
-  const groups = new Map<string, DeployRecord[]>()
-  for (const r of records) {
-    if (r.kind !== 'executed' || r.outcome !== 'failed' || r.service === undefined || r.version === undefined) continue
-    const key = `${r.service} ${r.version}`
-    groups.set(key, [...groups.get(key) ?? [], r])
-  }
-  return [...groups].flatMap(([key, failed]) => {
-    const [service = '', version = ''] = key.split(' ')
-    const times = failed.map(r => r.at ?? 0)
-    const spanHours = (Math.max(...times) - Math.min(...times)) / 3600_000
-    if (failed.length <= active.threshold) return []
-    const denials = records.filter(r => r.kind === 'denied' && r.text.includes(` ${service} ${version} `)).length
-    return [{
-      service, version, failures: failed.length, denials,
-      sessions: new Set(failed.map(r => r.session)).size, spanHours, evidence: failed.map(r => r.ref),
-    }]
-  })
 }

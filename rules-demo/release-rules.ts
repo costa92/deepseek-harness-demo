@@ -47,6 +47,8 @@ export interface Config {
   normalize?: (service: string, version: string) => { service: string; version: string }
   /** Injectable clock for the time windows. */
   now?: () => number
+  /** Also record every failed deploy-tool result (guard denials included) as a failed release; off by default. */
+  recordErrors?: boolean
 }
 
 type Args = { service?: unknown; version?: unknown }
@@ -66,13 +68,19 @@ export class ReleaseRules extends Service {
       lookupTool: config.lookupTool ?? 'lookup_release',
       normalize: config.normalize ?? ((service, version) => ({ service, version })),
       now: config.now ?? Date.now,
+      recordErrors: config.recordErrors ?? false,
     }
     const { deployTool, lookupTool } = this.config
 
     // 1. 事实来源：观察部署工具的最终结果，写进历史。部署失败是工具正常返回的数据；
-    //    工具报错（含被守卫拒绝）的结果里没有可区分的错误码，一律不记。
+    //    工具报错（含被守卫拒绝）的结果里没有可区分的错误码，默认不记。
     ctx.on('tools/result', (exec, result) => {
-      if (exec.name !== deployTool || result.isError) return undefined
+      if (exec.name !== deployTool) return undefined
+      if (result.isError) {
+        const key = this.config.recordErrors ? this.keyOf(exec.arguments) : undefined
+        if (key !== undefined) this.events.push({ ...key, outcome: 'failed', at: this.config.now() })
+        return undefined
+      }
       const outcome = (result.value as { outcome?: unknown } | null)?.outcome
       const key = this.keyOf(exec.arguments)
       if (key === undefined || (outcome !== 'succeeded' && outcome !== 'failed')) return undefined

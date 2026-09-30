@@ -12,10 +12,10 @@ import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import * as checkpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
 import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { defineTool, type PreToolDecision } from '@deepseek-ai/dsh-tools'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
-import ApprovalService, { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
+import ApprovalService, { setApprovalPolicy, type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 import Storage from '@deepseek-ai/dsh-storage'
 import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import * as StorageJson from '@deepseek-ai/dsh-storage-json'
@@ -168,7 +168,13 @@ assert.deepEqual(table, [[0, 0], [4, 1], [3, 0]])
 
 log('\n== 3. 启用走 dsh 的审批：pre-execute 返回 ask ==')
 const seen: string[] = []
+/** Scripted answers for step 6; empty means the reviewer decides from the reason. */
+const overrides: (() => Promise<ApprovalOutcome>)[] = []
+let answered = 0
 review.ctx.on('approval/request', (req) => {
+  answered++
+  const override = overrides.shift()
+  if (override !== undefined) return override()
   // 脚本化的审批人：请求里不带参数，要看参数得按 callId 回发起方的会话日志找；回放里有误拦就拒绝。
   seen.push(`应答者收到 [${Object.keys(req).sort().join(', ')}]`)
   // oxlint-disable-next-line typescript/no-deprecated -- the answerer reads the asking agent's log on purpose
@@ -218,9 +224,11 @@ assert.deepEqual(store(review).active(), ['same-version-failed@3'])
 log('\n== 4. 规则的谱系：版本表、评测表和会话日志拼起来 ==')
 const approvals = new Map<string, { asked: string; outcome: string }>()
 const asked = new Map<string, string>()
+const decidedKeys = new Set<string>()
 for (const e of reviewEvents) {
   if (e.type === 'approval/asked' && e.data.callId !== undefined) asked.set(e.data.id, `rule-review#${e.data.callId}|rule-review#${e.seq}`)
   if (e.type === 'approval/decided') {
+    decidedKeys.add(Object.keys(e.data).sort().join(', '))
     const [callId = '', ref = ''] = (asked.get(e.data.id) ?? '').split('|')
     approvals.set(callId, { asked: ref, outcome: e.data.outcome })
   }
@@ -235,7 +243,9 @@ for (const revision of store(review).revisions('same-version-failed')) {
   }
 }
 log(`当前生效：${store(review).active().join(', ')}`)
+log(`日志里 approval/decided 的字段：[${[...decidedKeys].join(' | ')}]`)
 assert.equal(evaluations.length, 2)
+assert.deepEqual([...decidedKeys], ['id, outcome'])
 assert.deepEqual([...approvals.values()].map(a => a.outcome), ['rejected', 'allowed-once'])
 
 log('\n== 5. 生效之后：第 4 天再部署 ==')
@@ -252,7 +262,54 @@ log(`deploy(2.5) -> ${d25.replace(/,"at":\d+/, '')}`)
 assert.match(d23, /^拒绝 \[same-version-failed@3\]/)
 assert.match(d25, /"outcome":"succeeded"/)
 
-log('\n== 6. 审批的边界 ==')
+log('\n== 6. 审批服务在场：应答者的几种结果、never 策略、前置 allow ==')
+const probeAgent = await openSession(review, 'rule-review-probe')
+const lastResultOf = (agent: Agent) => {
+  // oxlint-disable-next-line typescript/no-deprecated -- the demo reads the whole log on purpose
+  const block = agent.session.snapshotEvents().flatMap(e => e.type === 'tool/result' ? e.data.message.content.flatMap(b => b.type === 'tool-result' ? [b] : []) : []).at(-1)!
+  return `${block.isError === true ? '失败' : '成功'} ${toolText(block)}`
+}
+const askedCounts: number[] = []
+const tryActivate = async (label: string, revision: number) => {
+  const before = answered
+  await ask(review, probeAgent, `申请启用第 ${revision} 版`, call('activate_rule', { ruleId: 'same-version-failed', revision }), reply('好。'))
+  const line = lastResultOf(probeAgent)
+  askedCounts.push(answered - before)
+  log(`${label} -> ${line}（问了应答者 ${answered - before} 次）`)
+  return line
+}
+const outcomeCases: [string, () => Promise<ApprovalOutcome>][] = [
+  ['应答者返回 cancelled', () => Promise.resolve('cancelled')],
+  ['应答者返回 unavailable', () => Promise.resolve('unavailable')],
+  ['应答者抛错', () => Promise.reject(new Error('审批后台挂了'))],
+  ["应答者返回未知值 'maybe'", () => Promise.resolve('maybe' as ApprovalOutcome)],
+]
+const outcomeLines: string[] = []
+for (const [label, answer] of outcomeCases) {
+  overrides.push(answer)
+  outcomeLines.push(await tryActivate(label, 1))
+}
+setApprovalPolicy(probeAgent.session, 'never')
+const neverLine = await tryActivate('会话策略改成 never', 1)
+setApprovalPolicy(probeAgent.session, 'ask')
+const evaluationsBefore = store(review).evaluations().length
+const allowAll = review.ctx.on('tools/pre-execute', () => Promise.resolve<PreToolDecision>({ kind: 'allow' }), true)
+const allowLine = await tryActivate('最外层再挂一个直接 allow 的监听器', 3)
+allowAll()
+log(`  评测表条数没变：${store(review).evaluations().length === evaluationsBefore}`)
+assert.deepEqual(outcomeLines, [
+  '失败 Error: approval for tool "activate_rule" was cancelled',
+  '失败 Error: tool "activate_rule" requires approval, but no approval channel is available',
+  '失败 Error: tool "activate_rule" requires approval, but no approval channel is available',
+  '失败 Error: tool "activate_rule" requires approval, but no approval channel is available',
+])
+assert.equal(neverLine, '失败 Error: the user rejected tool "activate_rule"')
+assert.equal(allowLine, '成功 已启用 same-version-failed@3')
+assert.deepEqual(askedCounts, [1, 1, 1, 1, 0, 0])
+assert.equal(store(review).evaluations().length, evaluationsBefore)
+assert.deepEqual(store(review).active(), ['same-version-failed@3'])
+
+log('\n== 7. 审批不在场 ==')
 log('不经过 agent 直接调 activate_rule：')
 log(`  ${await direct('activate_rule', { ruleId: 'same-version-failed', revision: 1 })}`)
 await review.approval.dispose()

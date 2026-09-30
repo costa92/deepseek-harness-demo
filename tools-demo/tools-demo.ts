@@ -14,6 +14,14 @@ import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import { SandboxedFileSystem } from '@deepseek-ai/dsh-fs-sandbox'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import SessionProjections from '@deepseek-ai/dsh-session-projection'
+import LlmRuntime, { LlmAdapter, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import { LocalSandboxProvider } from '@deepseek-ai/dsh-sandbox-local'
+import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
+import PtcRuntimeNode from '@deepseek-ai/dsh-ptc-runtime-node'
 
 const log = (msg: string) => { console.log(msg) }
 // 插件重载是异步的：按条件等，而不是固定让出几拍。
@@ -128,7 +136,8 @@ log('6. scope: an agent-scoped registration shadows the global one')
 const agentA = { id: 'agent-A' }
 // createScope 继承调用方插件的依赖 API，所以得在声明了 inject: ['tools'] 的插件里建。
 let scoped!: ReturnType<typeof createScope>
-await root.plugin({ name: 'agent-host', inject: ['tools'], apply(ctx: Context) { scoped = createScope(ctx, agentA) } })
+let hostCtx!: Context
+await root.plugin({ name: 'agent-host', inject: ['tools'], apply(ctx: Context) { hostCtx = ctx; scoped = createScope(ctx, agentA) } })
 scoped.ctx.tools.register(lookup('on-call preset: production only'))
 log(`  global view : ${root.tools.get('lookup_release')?.description}`)
 log(`  agent-A view: ${root.tools.get('lookup_release', agentA)?.description}`)
@@ -151,5 +160,131 @@ log(`  scope disposed: tools/change fired ${changes}x, agent-A view=${root.tools
 assert.equal(changes, 2)
 assert.equal(root.tools.get('lookup_release', agentA)?.description, 'global release lookup')
 assert.equal(names(root, agentA), 'edit,lookup_release,read,write')
+
+log('8. fs-sandbox escalation: one approved wider retry')
+const asked: string[] = []
+// 审批服务的桩：只记下请求并批准一次，不走真实的 dsh-user-approval（它要求处于打开的回合里）。
+root.provide('approval', { request: async (req: { toolName: string; reason: string }) => { asked.push(`${req.toolName}: ${req.reason}`); return 'allowed-once' } })
+const agentE = { id: 'agent-E' }
+r = await call(root, 'write', { file_path: target, content: 'escalated', sandbox_permissions: 'workspace-write', justification: 'save the on-call note' }, agentE)
+log(`  approval asked: ${asked.join(' | ')}`)
+log(`  escalated write -> isError=${r.isError}`)
+assert.deepEqual(asked, ['write: escalate sandbox to workspace-write: save the on-call note'])
+assert.equal(r.isError, false)
+r = await call(root, 'write', { file_path: target, content: 'plain' }, agentE)
+log(`  next write without escalation -> isError=${r.isError} code=${r.error?.info?.code}`)
+assert.equal(r.error?.info?.code, 'FS_SANDBOX_DENIED')
+
+log('9. restrict() hard checks, and tools/change is not scope-filtered')
+const agentB = { id: 'agent-B' }
+const scopeA = createScope(hostCtx, agentA)
+const scopeB = createScope(hostCtx, agentB)
+const restrictError = (label: string, fn: () => unknown) => {
+  try { fn() } catch (e) { log(`  ${label} -> ${(e as Error).message.split(/[:;]/)[0]}`); return }
+  assert.fail(`${label} did not throw`)
+}
+restrictError('root.restrict({ deny: [edit] })', () => root.tools.restrict({ deny: ['edit'] }))
+restrictError('scoped.restrict({})', () => scopeA.ctx.tools.restrict({}))
+restrictError('scoped.restrict({ deny: [nope] })', () => scopeA.ctx.tools.restrict({ deny: ['nope'] }))
+let seenByB = 0
+scopeB.ctx.on('tools/change', () => { seenByB++ })
+scopeA.ctx.tools.register(lookup('agent-A only'))
+log(`  agent-A registers a scoped tool -> agent-B listener fired ${seenByB}x, agent-B view=${root.tools.get('lookup_release', agentB)?.description}`)
+assert.equal(seenByB, 1)
+assert.equal(root.tools.get('lookup_release', agentB)?.description, 'global release lookup')
+await scopeA.dispose()
+await scopeB.dispose()
+
+log('10. a real agent step: what the model request carries')
+class ScriptedModel extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
+  readonly script: StreamChunk[][] = []
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({ provider, id: model, name: model })
+  }
+  async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.requests.push(options)
+    const entry = this.script.shift()
+    assert.ok(entry, 'the scripted model ran out of replies')
+    for (const chunk of entry) yield chunk
+  }
+}
+const host = new Context()
+await host.plugin(LlmRuntime)
+await host.plugin(SessionStore)
+await host.plugin(SessionProjections)
+await host.plugin(SystemPrompt)
+await host.plugin(ToolRuntime)
+await host.plugin(AgentRegistry)
+const model = new ScriptedModel()
+host.llm.registerAdapter(['mock'], model)
+// 第 5 步把数据源改成了带 approver 的脏数据，这里换回干净记录。
+source = [{ id: 'demo-003', service: 'payment-api', version: '1.4.2', status: 'failed' }]
+const concurrent = { ...lookup('global release lookup'), isConcurrencySafe: () => true }
+host.tools.register(concurrent)
+await host.plugin(AgentLoop, { agents: [] })
+const argsJson = JSON.stringify({ service: 'payment-api' })
+const toolId = ToolCallId('call-1')
+model.script.push([
+  { type: 'block-start', index: 0, blockType: 'tool-call' },
+  { type: 'tool-call-delta', index: 0, id: toolId, name: 'lookup_release', argumentsDelta: argsJson },
+  { type: 'block-end', index: 0, block: { type: 'tool-call', id: toolId, name: 'lookup_release', arguments: argsJson } },
+  { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
+  { type: 'finish', reason: { kind: 'tool-calls' } },
+], [
+  { type: 'block-start', index: 0, blockType: 'text' },
+  { type: 'text-delta', index: 0, text: 'done' },
+  { type: 'block-end', index: 0, block: { type: 'text', text: 'done' } },
+  { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
+  { type: 'finish', reason: { kind: 'stop' } },
+])
+// 第一步执行工具时再注册一个工具，看第二步的请求里有没有它。
+host.on('tools/post-execute', async (exec, _result, next) => {
+  if (exec.name === 'lookup_release') host.tools.register(defineTool({
+    name: 'late_tool', description: 'registered mid-turn', parameters: {},
+    output: { schema: { type: 'object', additionalProperties: false, properties: {} }, render: () => [{ type: 'text', text: 'ok' }] },
+    async execute() { return {} },
+  }))
+  return next()
+})
+const { agent } = await host.agents.create({ sessionId: SessionId('tools-demo'), agentOptions: { provider: 'mock', model: 'mock' } })
+agent.followup(createUserMessage({ content: [{ type: 'text', text: 'payment-api?' }], source: { kind: 'user' } }))
+await agent.whenIdle()
+const [req1, req2] = model.requests
+const sent = req1?.tools?.find(t => t.name === 'lookup_release')
+log(`  request 1 tools: ${req1?.tools?.map(t => t.name).join(',')}; lookup_release keys: ${Object.keys(sent ?? {}).join(',')}`)
+log(`  request 2 tools: ${req2?.tools?.map(t => t.name).join(',')}`)
+assert.deepEqual(Object.keys(sent ?? {}), ['name', 'description', 'parameters'])
+assert.ok(!JSON.stringify(req1).includes('5000'))
+assert.deepEqual(req2?.tools?.map(t => t.name), ['late_tool', 'lookup_release'])
+// oxlint-disable-next-line typescript/no-deprecated -- the demo reads the whole log on purpose
+const logged = JSON.stringify(agent.session.snapshotEvents())
+log(`  session events contain the value's "demo-003"? ${logged.includes('demo-003')}; contain the rendered "1 record(s)"? ${logged.includes('1 record(s)')}`)
+assert.ok(!logged.includes('demo-003'))
+assert.ok(logged.includes('1 record(s)'))
+await host.fiber.dispose()
+
+log('11. PTC mode: the SDK declaration carries the output shape')
+const ptc = new Context()
+await ptc.plugin(SessionProjections)
+await ptc.plugin(SystemPrompt)
+await ptc.plugin(ToolRuntime, { mode: 'ptc' })
+await ptc.plugin(LocalSandboxProvider, {})
+await ptc.plugin(SandboxPolicy, { mode: 'workspace-write', workspaceRoot: dir })
+await ptc.plugin(LocalSubprocessRuntime)
+await ptc.plugin(LocalFileSystem, { cwd: dir })
+await ptc.plugin(PtcRuntimeNode)
+await until(() => ptc.get('ptcRuntime') !== undefined, 'the PTC runtime')
+ptc.tools.register(lookup('global release lookup'))
+const assembled = await ptc.systemPrompt.assemble({})
+const sdk = assembled.sections.map(x => x.text).join('\n')
+const outputMap = sdk.slice(sdk.indexOf('interface ToolOutputMap'), sdk.indexOf('type ToolName'))
+log(`  model tools: ${assembled.tools.map(t => t.name).join(',')}`)
+log('  system prompt SDK declares:')
+for (const line of outputMap.trimEnd().split('\n')) log(`    ${line}`)
+assert.deepEqual(assembled.tools.map(t => t.name), ['run_code'])
+assert.ok(outputMap.includes('records: ({'))
+assert.ok(outputMap.includes('status: "succeeded" | "failed";'))
+await ptc.fiber.dispose()
 
 process.exit(0)

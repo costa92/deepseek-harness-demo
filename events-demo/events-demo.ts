@@ -12,6 +12,11 @@ declare module '@deepseek-ai/cordis' {
     'release/queried'(query: Query, count: number): void
     'release/audit'(query: Query): Promise<void>
     'release/notify'(query: Query): Promise<string | void>
+    'check/serial'(): Promise<unknown>
+    'check/bail'(): unknown
+    'check/waterfall'(next: () => string): string | undefined
+    'check/value'(): unknown
+    'check/async'(): Promise<void>
   }
 }
 
@@ -112,4 +117,76 @@ result = root.waterfall('release/query', query, inner)
 log(`  result=${JSON.stringify(result)}`)
 assert.equal(result[0]?.token, 'tok_live_9f3a')
 assert.ok(!lines.includes('  never reached'))
+
+log('8. serial / bail / waterfall when a listener throws')
+const skipped: string[] = []
+const throwers = root.plugin({ name: 'throwers', apply(ctx: Context) {
+  ctx.on('check/serial', async () => { throw new Error('serial boom') })
+  ctx.on('check/serial', async () => { skipped.push('serial') })
+  ctx.on('check/bail', () => { throw new Error('bail boom') })
+  ctx.on('check/bail', () => { skipped.push('bail') })
+  ctx.on('check/waterfall', () => { throw new Error('waterfall boom') })
+  ctx.on('check/waterfall', (next) => { skipped.push('waterfall'); return next() })
+} })
+await throwers
+await assert.rejects(root.serial('check/serial'), (e: Error) => { log(`  serial rejected: ${e.message}`); return e.message === 'serial boom' })
+assert.throws(() => root.bail('check/bail'), (e: Error) => { log(`  bail threw: ${e.message}`); return e.message === 'bail boom' })
+assert.throws(() => root.waterfall('check/waterfall', () => { skipped.push('inner'); return 'inner' }), (e: Error) => {
+  log(`  waterfall threw: ${e.message}`)
+  return e.message === 'waterfall boom'
+})
+log(`  later listeners / inner ran: [${skipped}]`)
+assert.deepEqual(skipped, [])
+await throwers.dispose()
+
+log('9. nobody bails, a middleware returns undefined')
+const quiet = root.plugin({ name: 'quiet', apply(ctx: Context) {
+  ctx.on('check/serial', async () => undefined)
+  ctx.on('check/bail', () => null)
+  ctx.on('check/waterfall', (next) => { next() })
+} })
+await quiet
+const serialNone = await root.serial('check/serial')
+const bailNone = root.bail('check/bail')
+const waterfallNone = root.waterfall('check/waterfall', () => 'inner value')
+log(`  serial=${serialNone}, bail=${bailNone}, waterfall=${waterfallNone} (inner returned "inner value")`)
+assert.equal(serialNone, undefined)
+assert.equal(bailNone, undefined)
+assert.equal(waterfallNone, undefined)
+await quiet.dispose()
+
+log('10. isBailed on edge values')
+const verdicts: string[] = []
+for (const value of [null, false, undefined, 0, '', NaN]) {
+  let second = false
+  const probe = root.plugin({ name: 'probe', apply(ctx: Context) {
+    ctx.on('check/value', () => value)
+    ctx.on('check/value', () => { second = true; return 'next' })
+  } })
+  await probe
+  const out = root.bail('check/value')
+  const label = typeof value === 'string' ? "''" : String(value)
+  verdicts.push(`${label}->${second ? 'continue' : 'stop'}`)
+  log(`  ${label.padEnd(9)} -> ${second ? 'continue, result=' + JSON.stringify(out) : 'stop, result=' + (typeof out === 'string' ? JSON.stringify(out) : String(out))}`)
+  await probe.dispose()
+}
+assert.deepEqual(verdicts, ['null->continue', 'false->continue', 'undefined->continue', '0->stop', "''->stop", 'NaN->stop'])
+
+log('11. emit with an async listener that rejects')
+const unhandled: string[] = []
+const onUnhandled = (reason: unknown) => { unhandled.push((reason as Error).message) }
+process.on('unhandledRejection', onUnhandled)
+const asyncFail = root.plugin({ name: 'async-fail', apply(ctx: Context) {
+  ctx.on('check/async', async () => { throw new Error('async listener failed') })
+} })
+await asyncFail
+root.emit('check/async')
+log('  emit returned without throwing')
+await new Promise(r => setTimeout(r, 10))
+process.off('unhandledRejection', onUnhandled)
+log(`  unhandledRejection: ${unhandled.join(', ')}`)
+assert.deepEqual(unhandled, ['async listener failed'])
+await asyncFail.dispose()
+
+log('12. dispose root')
 await root.fiber.dispose()

@@ -16,21 +16,34 @@ import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
+import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as checkpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
+import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
+import { LocalSandboxProvider } from '@deepseek-ai/dsh-sandbox-local'
+import { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
+import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
+import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
+import PtcRuntimeNode from '@deepseek-ai/dsh-ptc-runtime-node'
 import { ReleaseRules, failedTwiceIn24h, rulePlugin, type Config as RulesConfig } from './release-rules.ts'
+import { readDeploys } from './log-miner.ts'
 
 const log = (msg: string) => { console.log(msg) }
 const base = mkdtempSync(join(tmpdir(), 'dsh-mcp-client-'))
 process.on('exit', () => { rmSync(base, { recursive: true, force: true }) })
 const SERVER = fileURLToPath(new URL('./release-mcp-server.mjs', import.meta.url))
 const MCP_DEPLOY = 'mcp__release__deploy_release'
+const sessionLogs = join(base, 'sessions')
 const now = Date.UTC(2026, 8, 28, 1)
 // 宿主进程里有一个凭据形的环境变量（假值），看它会不会传给 MCP 服务器。
 process.env.RELEASE_API_TOKEN = 'demo-token'
+// 再放一个 DSH_ 开头、名字不像凭据的变量，看它会不会传过去。
+process.env.DSH_DEMO_MARKER = 'on'
 
 // ── 脚本化模型：每轮调一次工具，看到工具结果后回一句话 ─────────────────────────────
 interface Call { name: string; args: object }
 class ScriptedModel extends LlmAdapter {
-  readonly calls: Call[] = []
+  // 一项是一条回复：单个调用，或同一条消息里的多个调用。
+  readonly calls: (Call | Call[])[] = []
   readonly requests: GenerateOptions[] = []
   private seq = 0
   override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
@@ -50,13 +63,17 @@ class ScriptedModel extends LlmAdapter {
       { type: 'finish', reason: { kind: 'stop' } },
     ]
   }
-  private toolCall(call: Call): StreamChunk[] {
-    const id = ToolCallId(`call-${++this.seq}`)
-    const json = JSON.stringify(call.args)
+  private toolCall(calls: Call | Call[]): StreamChunk[] {
     return [
-      { type: 'block-start', index: 0, blockType: 'tool-call' },
-      { type: 'tool-call-delta', index: 0, id, name: call.name, argumentsDelta: json },
-      { type: 'block-end', index: 0, block: { type: 'tool-call', id, name: call.name, arguments: json } },
+      ...[calls].flat().flatMap((call, index): StreamChunk[] => {
+        const id = ToolCallId(`call-${++this.seq}`)
+        const json = JSON.stringify(call.args)
+        return [
+          { type: 'block-start', index, blockType: 'tool-call' },
+          { type: 'tool-call-delta', index, id, name: call.name, argumentsDelta: json },
+          { type: 'block-end', index, block: { type: 'tool-call', id, name: call.name, arguments: json } },
+        ]
+      }),
       { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
       { type: 'finish', reason: { kind: 'tool-calls' } },
     ]
@@ -79,8 +96,15 @@ const localDeploy = defineTool({
 // ── 宿主 ───────────────────────────────────────────────────────────────
 interface HostOptions {
   rules?: RulesConfig
-  approval?: boolean
+  /** true：审批服务 + 对 MCP 部署返回 ask；'service'：只挂审批服务。 */
+  approval?: boolean | 'service'
   env?: Record<string, string>
+  /** 会话日志写进 JSONL，供第 23 篇的 readDeploys 读。 */
+  persist?: boolean
+  /** tools 用 PTC 模式，挂 PTC 进程运行时（第 25 篇同款）。 */
+  ptc?: boolean
+  /** 额外的 mcp-client 配置。 */
+  mcp?: { maxInstructionBytes?: number; toolCallTimeoutMs?: number }
 }
 interface Host { ctx: Context; model: ScriptedModel; agent: Agent; ledger: string; asks: string[]; logs: string[] }
 let hosts = 0
@@ -93,17 +117,30 @@ async function boot(options: HostOptions = {}): Promise<Host> {
   await ctx.plugin(SessionStore)
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(ToolRuntime, options.ptc === true ? { mode: 'ptc' } : {})
   await ctx.plugin(AgentRegistry)
+  if (options.persist === true) {
+    await ctx.plugin(JsonlSessionPersistence, { root: sessionLogs, compression: 'none' })
+    await ctx.plugin(checkpointPolicy)
+  }
+  if (options.ptc === true) {
+    await ctx.plugin(LocalSandboxProvider, {})
+    await ctx.plugin(SandboxPolicyService, { mode: 'workspace-write', workspaceRoot: base })
+    await ctx.plugin(LocalSubprocessRuntime)
+    await ctx.plugin(LocalFileSystem, { cwd: base })
+    await ctx.plugin(PtcRuntimeNode)
+  }
   await ctx.plugin(AgentLoop, { agents: [] })
   const asks: string[] = []
-  if (options.approval === true) {
+  if (options.approval !== undefined && options.approval !== false) {
     await ctx.plugin(ApprovalService, { policy: 'ask' })
     // 脚本化的审批人：每次都批准。
     ctx.on('approval/request', (req) => {
       asks.push(req.callId ?? '-')
       return Promise.resolve('allowed-once')
     })
+  }
+  if (options.approval === true) {
     ctx.on('tools/pre-execute', (exec, next) => exec.name === MCP_DEPLOY
       ? Promise.resolve({ kind: 'ask', reason: '部署要人工确认' } as const)
       : next())
@@ -123,6 +160,7 @@ async function boot(options: HostOptions = {}): Promise<Host> {
     args: [SERVER, ledger],
     env: options.env ?? {},
     reconnect: { initialDelayMs: 20, maxDelayMs: 1000, maxAttempts: 3 },
+    ...options.mcp,
   })
   const model = new ScriptedModel()
   ctx.llm.registerAdapter(['scripted'], model)
@@ -130,8 +168,11 @@ async function boot(options: HostOptions = {}): Promise<Host> {
   return { ctx, model, agent, ledger, asks, logs }
 }
 async function deploy(host: Host, version: unknown, name = MCP_DEPLOY): Promise<string> {
-  host.model.calls.push({ name, args: { service: 'payment-api', version } })
-  host.agent.followup(createUserMessage({ content: [{ type: 'text', text: `发布 payment-api ${String(version)}` }], source: { kind: 'user' } }))
+  return turn(host, `发布 payment-api ${String(version)}`, { name, args: { service: 'payment-api', version } })
+}
+async function turn(host: Host, text: string, calls: Call | Call[]): Promise<string> {
+  host.model.calls.push(calls)
+  host.agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
   await host.agent.whenIdle()
   assert.equal(host.model.calls.length, 0)
   return lastResult(host)
@@ -145,7 +186,7 @@ function lastResult(host: Host): string {
   const text = block.content.map(c => c.type === 'text' ? c.text : '').join('')
   return block.isError ? `报错「${text}」` : text
 }
-type LedgerEntry = { event: string; token?: string; version?: string; outcome?: string }
+type LedgerEntry = { event: string; token?: string; dsh?: string; version?: string; outcome?: string }
 const ledgerOf = (host: Host): LedgerEntry[] => readFileSync(host.ledger, 'utf8').split('\n').filter(Boolean)
   .map(line => JSON.parse(line) as LedgerEntry)
 const count = (host: Host, event: string) => ledgerOf(host).filter(e => e.event === event).length
@@ -173,6 +214,19 @@ log(`工具 schema 的字段：${Object.keys(schema).sort().join(', ')}`)
 const serverSchema = { type: 'object', properties: { service: { type: 'string' }, version: { type: 'string' } }, required: ['service', 'version'] }
 log(`parameters 与服务器的 inputSchema 相同：${String(JSON.stringify(schema.parameters) === JSON.stringify(serverSchema))}`)
 log('服务器声明的 annotations（destructiveHint）和 outputSchema 没有交给模型')
+const odd = await boot({ env: { RELEASE_ODD_NAMES: '1' } })
+await until(() => odd.ctx.tools.schemas().some(t => t.name.startsWith('mcp__release__')), 'the odd-name sync')
+const oddNames = odd.ctx.tools.schemas().map(t => t.name).filter(n => n.startsWith('mcp__release__')).sort()
+log('服务器另报两个名字不合规的工具 deploy.release 和 deploy_x…x（67 个字符）：')
+for (const name of oddNames) log(`  ${name}（${name.length} 个字符）`)
+const approvalOnly = await boot({ approval: 'service' })
+const destructive = await deploy(approvalOnly, '2.4')
+log(`只挂审批服务、不配 ask 规则：审批请求 ${approvalOnly.asks.length} 次，部署直接执行：${destructive}`)
+const sequential = await boot()
+const definition = sequential.ctx.tools.get(MCP_DEPLOY)
+await turn(sequential, '一次发两个', [{ name: MCP_DEPLOY, args: { service: 'payment-api', version: '2.8' } }, { name: MCP_DEPLOY, args: { service: 'order-api', version: '2.8' } }])
+const order = ledgerOf(sequential).filter(e => e.event === 'deploy' || e.event === 'reply').map(e => e.event)
+log(`工具定义的 isConcurrencySafe：${String(definition?.isConcurrencySafe)}；一条消息两个调用（每个 300 毫秒），服务器上：${order.join(' → ')}`)
 const system = systemText(request.messages.find(m => m.role === 'system'))
 const section = system.slice(system.indexOf('### MCP server'))
 log('系统提示里多了一段，服务器给的 instructions 原样拼在后面：')
@@ -180,12 +234,33 @@ for (const line of section.split('\n').filter(Boolean)) log(`  ${line}`)
 const handshake = ledgerOf(plain).slice(0, 5).map(e => e.event)
 log(`一次连接启动服务器进程 ${count(plain, 'start')} 次：${handshake.join(' → ')}`)
 log(`宿主进程有 RELEASE_API_TOKEN，服务器进程里：${ledgerOf(plain).map(e => e.token).filter(Boolean).join('、')}`)
+log(`宿主进程有 DSH_DEMO_MARKER，服务器进程里：${ledgerOf(plain).map(e => e.dsh).filter(Boolean).join('、')}`)
+const wordy = await boot({ mcp: { maxInstructionBytes: 10 } })
+await until(() => wordy.logs.some(t => t.includes('giving up')), 'the instructions give-up')
+const wordyLog = wordy.logs.filter(t => /exceed|retrying in|giving up/.test(t)).map(t => t.replace('mcp-client(release): ', '').replace(/ — .*/, ''))
+log('maxInstructionBytes 设成 10：')
+for (const line of wordyLog) log(`  ${line}`)
+log(`  服务器进程启动 ${count(wordy, 'start')} 次，注册的 MCP 工具 ${wordy.ctx.tools.schemas().filter(t => t.name.startsWith('mcp__')).length} 个`)
 assert.deepEqual(request.tools?.map(t => t.name), [MCP_DEPLOY])
 assert.deepEqual(Object.keys(schema).sort(), ['description', 'name', 'parameters'])
 assert.deepEqual(schema.parameters, serverSchema)
+assert.equal(oddNames.length, 3)
+assert.ok(oddNames.includes(MCP_DEPLOY))
+assert.ok(oddNames.filter(n => n !== MCP_DEPLOY).every(n => /_[0-9a-f]{12}$/.test(n)))
+assert.ok(oddNames.some(n => n.startsWith('mcp__release__deploy_release_') && n.length === 41))
+assert.ok(oddNames.some(n => n.length === 64))
+assert.equal(approvalOnly.asks.length, 0)
+assert.equal(destructive, 'payment-api 2.4 succeeded')
+assert.equal(definition?.isConcurrencySafe, undefined)
+assert.deepEqual(order, ['deploy', 'reply', 'deploy', 'reply'])
 assert.equal(section, '### MCP server: release\n\nAlways look up the latest release before deploying.')
 assert.deepEqual(handshake, ['start', 'server/discover', 'start', 'initialize', 'tools/list'])
 assert.deepEqual(ledgerOf(plain).map(e => e.token).filter(Boolean), ['absent', 'absent'])
+assert.deepEqual(ledgerOf(plain).map(e => e.dsh).filter(Boolean), ['absent', 'absent'])
+assert.equal(wordyLog.filter(t => t.includes('exceed maxInstructionBytes (10)')).length, 4)
+assert.equal(wordyLog.at(-1), 'giving up after 3 consecutive failed reconnect attempts')
+assert.equal(count(wordy, 'start'), 8)
+assert.equal(wordy.ctx.tools.schemas().filter(t => t.name.startsWith('mcp__')).length, 0)
 
 log('\n== 2. 第 21 篇的规则引擎：连续部署 2.3 三次 ==')
 const firstEntry = (host: Host) => {
@@ -215,7 +290,7 @@ const STRUCTURED: RulesConfig = {
   deployTool: MCP_DEPLOY,
   outcomeOf: value => (value as { structuredContent?: { outcome?: unknown } } | null)?.structuredContent?.outcome,
 }
-const adapted = await boot({ rules: STRUCTURED, approval: true })
+const adapted = await boot({ rules: STRUCTURED, approval: true, persist: true })
 const outcomes: string[] = []
 for (let i = 0; i < 3; i++) outcomes.push(await deploy(adapted, '2.3'))
 log(`再从 structuredContent 读结果：${firstEntry(adapted)}`)
@@ -225,6 +300,21 @@ assert.equal(count(adapted, 'deploy'), 2)
 assert.equal(adapted.ctx.releaseRules.history().length, 2)
 assert.equal(outcomes[2], '报错「Error: [same-version-failed-twice] payment-api 2.3 在 24 小时内已失败 2 次，停止重试」')
 assert.deepEqual(adapted.asks, ['call-1', 'call-2', 'call-3'])
+await adapted.ctx.fiber.dispose()
+const reader = new Context()
+await reader.plugin(SessionStore)
+await reader.plugin(SessionProjectionRegistry)
+await reader.plugin(JsonlSessionPersistence, { root: sessionLogs, compression: 'none' })
+await reader.plugin(SqliteSessionQueryEngine, { path: join(base, 'session-search.db') })
+const byOldName = await readDeploys(reader, 'deploy_release')
+const byMcpName = await readDeploys(reader, MCP_DEPLOY)
+log(`第 23 篇的 readDeploys 读这台宿主的日志：按 deploy_release 读回 ${byOldName.length} 条；按 MCP 名读回 ${byMcpName.length} 条（${byMcpName.map(r => r.kind).join('、')}）`)
+log(`  读回的记录里 service/version/outcome：${byMcpName.every(r => r.service === undefined && r.version === undefined && r.outcome === undefined) ? '都没有' : '有'}，tool/result 没有 meta：${byMcpName.every(r => !r.dataKeys.includes('meta'))}`)
+assert.equal(byOldName.length, 0)
+assert.deepEqual(byMcpName.map(r => r.kind), ['executed', 'executed', 'error'])
+assert.ok(byMcpName.every(r => r.service === undefined && r.version === undefined && r.outcome === undefined))
+assert.ok(byMcpName.every(r => !r.dataKeys.includes('meta')))
+await reader.fiber.dispose()
 
 log('\n== 3. 参数不经 dsh 校验：version 传成数字 2.3 ==')
 const typed = await boot({ rules: STRUCTURED })
@@ -243,13 +333,14 @@ assert.equal(typed.ctx.releaseRules.history().length, 2)
 assert.equal(count(typed, 'deploy'), 3)
 
 log('\n== 4. 服务器在回复前崩溃，之后重连 ==')
-const crashy = await boot({ env: { RELEASE_API_TOKEN: 'demo-token' } })
+const crashy = await boot({ env: { RELEASE_API_TOKEN: 'demo-token' }, rules: STRUCTURED })
 log(`env 里显式传入后，服务器进程里：${ledgerOf(crashy).map(e => e.token).filter(Boolean).join('、')}`)
 const before = crashy.ctx.tools.get(MCP_DEPLOY)
 const crashed = await deploy(crashy, '2.6')
 const crashDeploy = ledgerOf(crashy).findLast(e => e.event === 'deploy')
+const crashHistory = crashy.ctx.releaseRules.history().length
 log(`部署 2.6：${crashed}`)
-log(`  平台账本里这次部署已经执行：${crashDeploy?.version} ${crashDeploy?.outcome}`)
+log(`  平台账本里这次部署已经执行：${crashDeploy?.version} ${crashDeploy?.outcome}；规则历史 ${crashHistory} 条`)
 const during = await deploy(crashy, '2.4')
 log(`紧接着再部署：${during}`)
 await until(() => crashy.ctx.tools.get(MCP_DEPLOY) !== before && crashy.ctx.tools.get(MCP_DEPLOY) !== undefined, 'the reconnect re-sync')
@@ -260,6 +351,7 @@ log(`重连后工具换成新一代定义，再部署：${after}`)
 log(`服务器进程累计启动 ${count(crashy, 'start')} 次`)
 assert.deepEqual(ledgerOf(crashy).map(e => e.token).filter(Boolean).slice(0, 2), ['present', 'present'])
 assert.equal(crashed, '报错「Error: Connection closed」')
+assert.equal(crashHistory, 0)
 assert.deepEqual(ledgerOf(crashy).filter(e => e.event === 'deploy').map(e => e.version), ['2.6', '2.4'])
 assert.equal(during, '报错「Error: Not connected」')
 assert.equal(after, 'payment-api 2.4 succeeded')
@@ -283,5 +375,46 @@ assert.deepEqual(gaveUp, [
 ])
 assert.deepEqual(tools, [])
 assert.equal(gone, '报错「Error: unknown tool "mcp__release__deploy_release"」')
+const startsAtGiveUp = count(crashy, 'start')
+await sleep(1500)
+log(`放弃后等 1.5 秒（超过重连上限 1 秒）：服务器进程启动次数 ${startsAtGiveUp} → ${count(crashy, 'start')}，工具仍${crashy.ctx.tools.get(MCP_DEPLOY) === undefined ? '不在' : '在'}注册表里`)
+const buffered = crashy.ctx.logger.buffer.map(m => String(m.args[0])).filter(t => /reconnecting in|retrying in|reconnected|giving up/.test(t))
+  .map(t => t.replace('mcp-client(release): ', '').replace(/ — .*/, '').replace(/ in \d+ms.*/, ''))
+log(`logger 默认缓冲（不设级别）里留下的重连记录：${buffered.join('；')}`)
+assert.equal(count(crashy, 'start'), startsAtGiveUp)
+assert.equal(crashy.ctx.tools.get(MCP_DEPLOY), undefined)
+assert.deepEqual(buffered, ['reconnected and re-synced tools (attempt 1/3)', 'giving up after 3 consecutive failed reconnect attempts'])
 
-for (const host of [plain, byName, renamed, adapted, typed, crashy]) await host.ctx.fiber.dispose()
+log('\n== 5. PTC 程序调 MCP 工具、服务器改工具列表、调用超时 ==')
+const programmed = await boot({ ptc: true })
+const program = `const r = await tools.${MCP_DEPLOY}({ service: 'payment-api', version: '2.4' })\nreturn JSON.stringify(r)`
+const fromProgram = await turn(programmed, '写程序发布 payment-api 2.4', { name: 'run_code', args: { code: program, description: 'Deploy' } })
+log(`PTC 程序里调 ${MCP_DEPLOY}，程序拿到的值：`)
+log(`  ${fromProgram}`)
+assert.equal(fromProgram, JSON.stringify({ content: [{ type: 'text', text: 'payment-api 2.4 succeeded' }], structuredContent: { service: 'payment-api', version: '2.4', outcome: 'succeeded' } }))
+assert.equal(count(programmed, 'deploy'), 1)
+
+const changing = await boot({ env: { RELEASE_LIST_CHANGE: '1' } })
+const ROLLBACK = 'mcp__release__rollback_release'
+const beforeChange = changing.ctx.tools.schemas().filter(t => t.name.startsWith('mcp__')).map(t => t.name)
+await deploy(changing, '2.4')
+await until(() => changing.ctx.tools.get(ROLLBACK) !== undefined, 'the list_changed re-sync')
+await deploy(changing, '2.5')
+const nextTools = changing.model.requests.at(-2)?.tools?.map(t => t.name) ?? []
+log(`服务器在第一次部署后发 tools/list_changed：工具 ${beforeChange.join(', ')} → 下一次模型请求里 ${nextTools.join(', ')}`)
+log(`  服务器进程启动 ${count(changing, 'start')} 次，tools/list 收到 ${count(changing, 'tools/list')} 次`)
+assert.deepEqual(beforeChange, [MCP_DEPLOY])
+assert.deepEqual(nextTools, [MCP_DEPLOY, ROLLBACK])
+assert.equal(count(changing, 'start'), 2)
+assert.equal(count(changing, 'tools/list'), 2)
+assert.ok(changing.logs.some(t => t.includes('tool list changed, re-syncing')))
+
+const hurried = await boot({ mcp: { toolCallTimeoutMs: 100 } })
+const timedOut = await deploy(hurried, '2.8')
+await until(() => count(hurried, 'reply') === 1, 'the late reply')
+log(`toolCallTimeoutMs 设成 100，服务器 300 毫秒后才回：${timedOut}`)
+log(`  平台账本：${ledgerOf(hurried).filter(e => e.event === 'deploy' || e.event === 'reply').map(e => `${e.event} ${e.version}`).join(' → ')}`)
+assert.match(timedOut, /^报错「/)
+assert.deepEqual(ledgerOf(hurried).filter(e => e.event === 'deploy' || e.event === 'reply').map(e => e.event), ['deploy', 'reply'])
+
+for (const host of [plain, odd, approvalOnly, sequential, wordy, byName, renamed, typed, crashy, programmed, changing, hurried]) await host.ctx.fiber.dispose()

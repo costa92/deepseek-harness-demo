@@ -12,13 +12,17 @@ import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import * as TimeoutPolicy from '@deepseek-ai/dsh-tool-call-timeout-policy'
 import * as RepeatReminder from '@deepseek-ai/dsh-repeat-tool-reminder'
+import * as toolFs from '@deepseek-ai/dsh-tool-fs'
+import * as toolBash from '@deepseek-ai/dsh-tool-bash'
+import * as toolWeb from '@deepseek-ai/dsh-tool-web'
 
 const log = (msg: string) => { console.log(msg) }
 
 // ── 脚本化模型：按剧本调工具，剧本用完就回一句话 ─────────────────────────────────
 interface Call { name: string; args: object }
 class ScriptedModel extends LlmAdapter {
-  readonly calls: Call[] = []
+  // 一个元素是一步；数组表示同一步里并发的几个调用。
+  readonly calls: (Call | Call[])[] = []
   readonly requests: GenerateOptions[] = []
   private seq = 0
   override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
@@ -37,13 +41,18 @@ class ScriptedModel extends LlmAdapter {
       { type: 'finish', reason: { kind: 'stop' } },
     ]
   }
-  private toolCall(call: Call): StreamChunk[] {
-    const id = ToolCallId(`call-${++this.seq}`)
-    const json = JSON.stringify(call.args)
+  private toolCall(step: Call | Call[]): StreamChunk[] {
+    const blocks = (Array.isArray(step) ? step : [step]).flatMap((call, index): StreamChunk[] => {
+      const id = ToolCallId(`call-${++this.seq}`)
+      const json = JSON.stringify(call.args)
+      return [
+        { type: 'block-start', index, blockType: 'tool-call' },
+        { type: 'tool-call-delta', index, id, name: call.name, argumentsDelta: json },
+        { type: 'block-end', index, block: { type: 'tool-call', id, name: call.name, arguments: json } },
+      ]
+    })
     return [
-      { type: 'block-start', index: 0, blockType: 'tool-call' },
-      { type: 'tool-call-delta', index: 0, id, name: call.name, argumentsDelta: json },
-      { type: 'block-end', index: 0, block: { type: 'tool-call', id, name: call.name, arguments: json } },
+      ...blocks,
       { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
       { type: 'finish', reason: { kind: 'tool-calls' } },
     ]
@@ -123,8 +132,46 @@ await ctx.plugin(ToolRuntime)
 await ctx.plugin(AgentRegistry)
 await ctx.plugin(AgentLoop, { agents: [] })
 await ctx.plugin(TimeoutPolicy)
+// 挂在超时包装里面，记下注册表交回给超时插件的原始结果。
+const inner: string[] = []
+ctx.on('tools/execute', async (_exec, next) => {
+  const result = await next()
+  inner.push(result.content.map(c => c.type === 'text' ? c.text : '').join(''))
+  return result
+})
 await ctx.plugin(RepeatReminder, { thresholds: [3, 5, 8], argumentsPreviewChars: 500 })
-for (const tool of [deploy, legacyDeploy, slowDashboard, status]) ctx.tools.register(tool)
+// 值班平台拒绝一切回滚；check_job 第 2 次调用时，模拟后台任务往会话里发一条 plugin 来源的通知。
+ctx.on('tools/pre-execute', async (exec, next) => exec.name === 'rollback_release'
+  ? { kind: 'deny', reason: 'rollback needs the duty lead' }
+  : await next())
+let rollbackBodies = 0
+const rollback = defineTool({
+  name: 'rollback_release',
+  description: 'Roll back to one version.',
+  parameters: { service: { type: 'string', required: true }, version: { type: 'string', required: true } },
+  output: { schema: text, render },
+  execute: () => { rollbackBodies += 1; return Promise.resolve('rolled back') },
+})
+let jobCalls = 0
+const job = defineTool({
+  name: 'check_job',
+  description: 'Check the smoke-test job.',
+  parameters: { job: { type: 'string', required: true } },
+  output: { schema: text, render },
+  execute: (_args, exec) => {
+    jobCalls += 1
+    if (jobCalls === 2) exec.agent?.inject(createUserMessage({ content: [{ type: 'text', text: '后台任务 smoke-2.7 已完成' }], source: { kind: 'plugin', plugin: 'jobs' } }))
+    return Promise.resolve('running')
+  },
+})
+const noteTool = defineTool({
+  name: 'note_progress',
+  description: 'Write one progress note.',
+  parameters: { text: { type: 'string', required: true } },
+  output: { schema: text, render },
+  execute: () => Promise.resolve('noted'),
+})
+for (const tool of [deploy, legacyDeploy, slowDashboard, status, rollback, job, noteTool]) ctx.tools.register(tool)
 const model = new ScriptedModel()
 ctx.llm.registerAdapter(['scripted'], model)
 const agentOptions = { provider: 'scripted', model: 'mock' }
@@ -140,11 +187,11 @@ function results(agent: Agent): { text: string; error?: unknown }[] {
   })
 }
 let sessions = 0
-async function turn(words: string, ...calls: Call[]): Promise<{ agent: Agent; requests: GenerateOptions[]; ms: number }> {
+async function turn(words: string, ...calls: (Call | Call[])[]): Promise<{ agent: Agent; requests: GenerateOptions[]; ms: number }> {
   const { agent } = await ctx.agents.create({ sessionId: SessionId(`duty-${String(++sessions)}`), agentOptions })
   return await more(agent, words, ...calls)
 }
-async function more(agent: Agent, words: string, ...calls: Call[]): Promise<{ agent: Agent; requests: GenerateOptions[]; ms: number }> {
+async function more(agent: Agent, words: string, ...calls: (Call | Call[])[]): Promise<{ agent: Agent; requests: GenerateOptions[]; ms: number }> {
   const before = model.requests.length
   const t0 = at()
   model.calls.push(...calls)
@@ -187,6 +234,8 @@ log('\n== 2. 不理 signal 的部署工具和没声明超时的工具 ==')
 const legacy = await turn('用旧流水线发 2.6', call('deploy_release_legacy', release('2.6')))
 log(`  deploy_release_legacy（声明 1000ms，不理 signal）| 用时 ${secs(legacy.ms)} | ${String(results(legacy.agent)[0]?.text)}`)
 log(`    平台此刻已上线 ${JSON.stringify(platform.live)}`)
+log(`    超时插件收到的原始结果 | ${String(inner.at(-1))}`)
+assert.equal(inner.at(-1), 'Error: tool call aborted')
 // 定时器可能比墙钟早触发几毫秒，留一点余量。
 assert.ok(legacy.ms >= ROLLOUT_MS - 50)
 assert.equal(results(legacy.agent)[0]?.text, 'Error: tool call timed out after 1000ms')
@@ -234,5 +283,93 @@ assert.equal(statusCalls, 6 + 6 + 4)
 assert.equal(reminders(alternating.requests).length, 0)
 assert.equal(reminders(counting.requests).length, 0)
 assert.equal(reminders([...interrupted.requests, ...resumed.requests]).length, 0)
+
+log('\n== 6. 随附工具声明的 timeoutMs ==')
+// 只看工具定义：底层的 fs/shell/web 服务用空对象占位，工具不会被调用。
+const bundled = new Context()
+await bundled.plugin(SystemPrompt)
+await bundled.plugin(ToolRuntime)
+for (const service of ['fs', 'shell', 'shellEnv', 'web']) (bundled as unknown as { provide: (name: string, value: object) => void }).provide(service, {})
+await bundled.plugin(toolFs)
+await bundled.plugin(toolBash)
+// 与基础组合里 tool-web 的配置相同。
+await bundled.plugin(toolWeb, { fetch: true, searchTimeoutMs: 60000 })
+const declared = ['bash', 'read', 'write', 'edit', 'web_fetch', 'web_search'].map(name => `${name}=${String(bundled.tools.get(name)?.timeoutMs)}`)
+log(`  ${declared.join('  ')}`)
+assert.deepEqual(declared, ['bash=undefined', 'read=undefined', 'write=undefined', 'edit=undefined', 'web_fetch=30000', 'web_search=60000'])
+await bundled.fiber.dispose()
+
+log('\n== 7. 用户中断和超时，谁先到算谁 ==')
+for (const cancelAt of [500, 1500]) {
+  const { agent } = await ctx.agents.create({ sessionId: SessionId(`duty-${String(++sessions)}`), agentOptions })
+  model.calls.push(call('deploy_release_legacy', release(`3.${String(cancelAt)}`)))
+  const t0 = at()
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: '用旧流水线发布' }], source: { kind: 'user' } }))
+  await sleep(cancelAt)
+  agent.cancel({ kind: 'user' })
+  await agent.whenIdle()
+  const [result] = results(agent)
+  log(`  ${String(cancelAt)}ms 时用户中断 deploy_release_legacy | 用时 ${secs(at() - t0)} | ${String(result?.text)} | 原始结果 ${String(inner.at(-1))}`)
+  assert.equal(result?.text, cancelAt < TIMEOUT_MS ? 'Error: tool call aborted' : 'Error: tool call timed out after 1000ms')
+  assert.equal(inner.at(-1), 'Error: tool call aborted')
+}
+await sleep(ROLLOUT_MS)
+
+log('\n== 8. 被拒的调用、plugin 通知、长参数、同一步并发 ==')
+const denied = await turn('回滚到 2.6', ...[1, 2, 3].map(() => call('rollback_release', release('2.6'))))
+log(`  rollback_release 被 pre-execute 拒绝 3 次 | ${String(results(denied.agent)[0]?.text)} | 提醒在第 ${reminders(denied.requests).map(r => r.request).join('、')} 次请求 | 工具体执行 ${String(rollbackBodies)} 次`)
+assert.deepEqual(reminders(denied.requests).map(r => r.request), [4])
+assert.equal(rollbackBodies, 0)
+assert.ok(results(denied.agent).every(r => r.text.startsWith('Error: ')))
+const jobs = await turn('盯着冒烟任务', ...[1, 2, 3].map(() => call('check_job', { job: 'smoke-2.7' })))
+const notice = jobs.requests.findIndex(r => r.messages.some(m => (m.source as { plugin?: string }).plugin === 'jobs'))
+log(`  check_job 连调 3 次，第 ${String(notice + 1)} 次请求里夹着后台任务的 plugin 通知 → 提醒在第 ${reminders(jobs.requests).map(r => r.request).join('、')} 次请求`)
+assert.equal(notice + 1, 3)
+assert.deepEqual(reminders(jobs.requests).map(r => r.request), [4])
+const longArgs = { ...release('2.7'), note: '灰度'.repeat(300) }
+const longPoll = await turn('带备注查状态', ...[1, 2, 3, 4, 5].map(() => call('check_status', longArgs)))
+const longNote = reminders(longPoll.requests).at(-1)?.text ?? ''
+const quoted = longNote.split('\n').find(line => line.startsWith('- arguments: ')) ?? ''
+log(`  参数 ${String(JSON.stringify(longArgs).length)} 字，第 5 次后的提醒里 | ${quoted.slice(0, 40)}……${quoted.slice(quoted.indexOf('…'))}`)
+assert.match(quoted, /… \(\+\d+ more chars\)$/)
+assert.equal(quoted.indexOf('…') - '- arguments: '.length, 500)
+const parallel = await turn('并发查三次', [1, 2, 3].map(() => call('check_status', release('2.7'))))
+log(`  同一步并发 3 个相同的 check_status → 提醒在第 ${reminders(parallel.requests).map(r => r.request).join('、')} 次请求`)
+assert.deepEqual(reminders(parallel.requests).map(r => r.request), [2])
+
+log('\n== 9. include / exclude ==')
+async function host(config: object): Promise<Context> {
+  const h = new Context()
+  await h.plugin(LlmRuntime)
+  await h.plugin(SessionStore)
+  await h.plugin(SessionProjectionRegistry)
+  await h.plugin(SystemPrompt)
+  await h.plugin(ToolRuntime)
+  await h.plugin(AgentRegistry)
+  await h.plugin(AgentLoop, { agents: [] })
+  await h.plugin(RepeatReminder, { thresholds: [3, 5, 8], argumentsPreviewChars: 500, ...config })
+  for (const tool of [status, noteTool]) h.tools.register(tool)
+  h.llm.registerAdapter(['scripted'], model)
+  return h
+}
+const interleaved = [1, 2, 3, 4, 5].map(n => n % 2 === 0 ? call('note_progress', { text: '仍在灰度' }) : call('check_status', release('2.7')))
+const noteOnly = [1, 2, 3].map(() => call('note_progress', { text: '仍在灰度' }))
+const cases: [string, object, (Call | Call[])[], number[]][] = [
+  ['默认配置，查 / 记 交替 5 次', {}, interleaved, []],
+  ["exclude: ['note_*']，同一序列", { exclude: ['note_*'] }, interleaved, [6]],
+  ["include: ['check_*']，记 3 次", { include: ['check_*'] }, noteOnly, []],
+]
+for (const [label, config, calls, expected] of cases) {
+  const h = await host(config)
+  const { agent } = await h.agents.create({ sessionId: SessionId('probe'), agentOptions })
+  const before = model.requests.length
+  model.calls.push(...calls)
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: label }], source: { kind: 'user' } }))
+  await agent.whenIdle()
+  const found = reminders(model.requests.slice(before)).map(r => r.request)
+  log(`  ${label} → ${found.length === 0 ? '提醒 0 条' : `提醒在第 ${found.join('、')} 次请求`}`)
+  assert.deepEqual(found, expected)
+  await h.fiber.dispose()
+}
 
 await ctx.fiber.dispose()

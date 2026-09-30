@@ -11,6 +11,8 @@ appendFileSync(join(dir, 'hook-ledger.jsonl'), `${JSON.stringify({
   payload,
   cwd: process.cwd(),
   token: process.env.RELEASE_API_TOKEN === undefined ? 'absent' : 'present',
+  dsh: process.env.DSH_DEMO_MARKER === undefined ? 'absent' : 'present',
+  at: Date.now(),
 })}\n`)
 
 const version = String(payload.tool_input?.version)
@@ -54,6 +56,17 @@ switch (mode) {
     break
   case 'allow':
     pre({ permissionDecision: 'allow' })
+    break
+  case 'deny':
+    pre({ permissionDecision: 'deny', permissionDecisionReason: `hook 拒绝 ${version}` })
+    break
+  // 放行，同时要求把版本改成 2.5。
+  case 'rewrite':
+    pre({ permissionDecision: 'allow', updatedInput: { ...payload.tool_input, version: '2.5' } })
+    break
+  // 什么都不决定，只占 300 毫秒。
+  case 'nap':
+    setTimeout(() => {}, 300)
     break
   // 部署后检查：平台回报 failed 就拦下结果，让模型别再重试。
   case 'post-check':

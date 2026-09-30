@@ -1,0 +1,5 @@
+# 叠在 acp profile 和 duty.cordis.patch.yml 之上：ACP 建会话时用脚本化的 scripted/mock。
+- id: acp
+  config:
+    provider: scripted
+    model: mock

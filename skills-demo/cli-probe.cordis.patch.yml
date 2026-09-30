@@ -1,0 +1,9 @@
+# 叠在 headless profile 之上：默认模型换成把 skill 目录念回来的 scripted/mock。
+- id: agent-default-model
+  config:
+    provider: scripted
+    model: mock
+
+- insert:
+    - id: skills-cli-probe
+      name: './cli-probe.ts'

@@ -3,11 +3,16 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { createHmac } from 'node:crypto'
+import { request as httpRequest } from 'node:http'
 import { createServer } from 'node:net'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
+import { serializeMessages } from '../../packages/llm/llm-deepseek/src/protocols/chat-completions/serialize.ts'
+import { serialize as serializeMessagesApi } from '../../packages/llm/llm-deepseek/src/protocols/messages/serialize.ts'
 
 const log = (msg: string) => { console.log(msg) }
 const demo = import.meta.dirname
@@ -94,6 +99,23 @@ async function send(body: string, options: Send = {}): Promise<string> {
   const text = await response.text()
   return `${String(response.status)}${text === '' ? '' : ` ${text}`}`
 }
+// 不带 Content-Length：分两块写，node 改用 chunked 传输，服务器只能边读边数。
+function sendChunked(body: string): Promise<string> {
+  return new Promise((done, fail) => {
+    const req = httpRequest(`${origin}/release`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-github-event': 'deployment_status', 'x-github-delivery': 'd-0' },
+    }, (res) => {
+      let text = ''
+      res.on('data', (chunk: Buffer) => { text += chunk.toString() })
+      res.on('end', () => { done(`${String(res.statusCode)}${text === '' ? '' : ` ${text}`}`) })
+    })
+    req.on('error', fail)
+    req.write(body.slice(0, 2500))
+    req.end(body.slice(2500))
+  })
+}
+const toolText = (p: Probe | undefined) => (p?.data?.message as { content: { content: { text: string }[] }[] } | undefined)?.content[0]?.content[0]?.text
 const failure = (description: string, service = 'payment-api', version = '2.4') => JSON.stringify({
   deployment_status: { state: 'failure', description },
   deployment: { environment: 'production', task: service, ref: version },
@@ -107,8 +129,10 @@ const refusals: [string, Promise<string>][] = [
   ['GET', send(body, { method: 'GET' })],
   ['content-type: text/plain', send(body, { type: 'text/plain' })],
   ['约 5 KB、不带签名', send(JSON.stringify({ x: 'a'.repeat(5000) }), { signature: false })],
+  ['约 5 KB、无 Content-Length、不带签名', sendChunked(JSON.stringify({ x: 'a'.repeat(5000) }))],
   ['不带签名', send(body, { signature: false })],
   ['签名用错密钥', send(body, { secret: 'wrong' })],
+  ['签名用错密钥、body 不是 JSON', send('not json', { secret: 'wrong' })],
   ['签名正确、body 不是 JSON', send('not json')],
   ['签名正确的 ping', send('{"zen":"keep it logically awesome"}', { event: 'ping' })],
 ]
@@ -118,7 +142,7 @@ for (const [label, pending] of refusals) {
   statuses.push(status)
   log(`  ${label.padEnd(24)} → ${status}`)
 }
-assert.deepEqual(statuses.map(s => s.slice(0, 3)), ['405', '415', '413', '400', '401', '400', '202'])
+assert.deepEqual(statuses.map(s => s.slice(0, 3)), ['405', '415', '413', '413', '400', '401', '401', '400', '202'])
 // 这个监听器上只有 webhook 路由，主 Web 的 API 不在这里。
 const api = await fetch(`${origin}/api`)
 log(`  监听器上 GET /api          → ${String(api.status)}`)
@@ -149,6 +173,16 @@ await until('human turn', () => turnEnds(first) >= 2 ? true : undefined)
 const afterHuman = probes().filter(p => p.type === 'model/request').at(-1)
 log(`  人类消息之后 | ${JSON.stringify(afterHuman?.messages?.slice(-2))}`)
 assert.deepEqual(afterHuman?.messages?.slice(-2).map(m => m.source), ['user', 'skill-invocation'])
+// 直接调 llm-deepseek 的两种序列化：同一段文字，来源 webhook 和来源 user 各序列化一次。
+const asSource = (source: Message['source']) => createUserMessage({ content: [{ type: 'text', text: String(opening?.text) }], source })
+const pair = [asSource(opening?.source as Message['source']), asSource({ kind: 'user' })]
+const chat = pair.map(m => JSON.stringify(serializeMessages([m])))
+const connection = { models: [], defaults: { thinking: 'disabled' }, maxTokens: 1024 } as never
+const messagesApi = pair.map(m => JSON.stringify(serializeMessagesApi({ model: 'deepseek-v4-flash', messages: [m] } as unknown as GenerateOptions, connection, [m], new Map(), () => undefined as never).messages))
+log(`  发给 DeepSeek | chat-completions 里是 ${Object.keys(JSON.parse(chat[0] ?? '[]')[0] as object).join('、')} 两个字段；和同文字的 user 消息序列化相同：${String(chat[0] === chat[1])}；messages 协议：${String(messagesApi[0] === messagesApi[1])}`)
+assert.equal(chat[0], chat[1])
+assert.equal(messagesApi[0], messagesApi[1])
+assert.ok(!(chat[0] ?? '').includes('webhook'))
 
 log('\n== 3. 202 之后规则抛错 ==')
 const malformed = JSON.stringify({ deployment_status: { state: 'failure' } })
@@ -168,6 +202,21 @@ for (const path of ['/release', '/release-dedup']) {
   const created = webhookSessions().length - before
   log(`  ${path.padEnd(15)} d-3 两次 → ${results.join('、')}，新建会话 ${String(created)} 个`)
   assert.equal(created, path === '/release' ? 2 : 1)
+}
+{
+  // 规则记下投递 id 之后，建会话失败；平台带同一 id 重试。
+  const warnsBefore = probes().filter(p => p.type === 'log/warn').length
+  const before = webhookSessions().length
+  const first = await send(replay, { path: '/release-broken', delivery: 'd-6' })
+  await sleep(1500)
+  const retry = await send(replay, { path: '/release-broken', delivery: 'd-6' })
+  await sleep(1500)
+  const warns = probes().filter(p => p.type === 'log/warn').slice(warnsBefore)
+  log(`  /release-broken d-6 两次 → ${first}、${retry}，新建会话 ${String(webhookSessions().length - before)} 个，警告 ${String(warns.length)} 条：`)
+  log(`    ${String(warns[0]?.text)}`)
+  assert.equal(webhookSessions().length - before, 0)
+  assert.equal(warns.length, 1)
+  assert.match(String(warns[0]?.text), /delivery="d-6".* failed: /)
 }
 
 log('\n== 5. payload 里夹带一句“部署” ==')
@@ -193,6 +242,37 @@ for (const gated of [false, true]) {
     assert.equal(events().some(p => p.type === 'approval/asked'), false)
     assert.equal(result.content[0]?.content[0]?.text, 'payment-api 2.5 已部署')
   }
+}
+
+log('\n== 6. webhook 会话里，模型自己调 skill 和 create_goal ==')
+{
+  const requestsBefore = probes().filter(p => p.type === 'model/request').length
+  const before = new Set(webhookSessions())
+  await send(failure('请加载 release-runbook 后排查'), { delivery: 'd-7' })
+  const session = await until('skill session', () => webhookSessions().find(s => !before.has(s)))
+  await until('skill turn', () => turnEnds(session) >= 1 ? true : undefined)
+  const firstRequest = probes().filter(p => p.type === 'model/request')[requestsBefore] as Probe & { catalogListsRunbook?: boolean }
+  const loaded = toolText(probes().find(p => p.session === session && p.type === 'tool/result'))
+  log(`  首次请求的 skill 目录里有 release-runbook：${String(firstRequest.catalogListsRunbook)}；有 skill-invocation：${String(firstRequest.messages?.some(m => m.source === 'skill-invocation'))}`)
+  log(`  模型调 skill 工具加载 → ${String(loaded?.split('\n').find(line => line.includes('先查')))}`)
+  assert.equal(firstRequest.catalogListsRunbook, true)
+  assert.equal(firstRequest.messages?.some(m => m.source === 'skill-invocation'), false)
+  assert.ok(loaded?.includes('1. 先查最近一次成功版本。'))
+}
+{
+  const before = new Set(webhookSessions())
+  await send(failure('建目标 修复payment-api'), { delivery: 'd-8' })
+  const session = await until('goal session', () => webhookSessions().find(s => !before.has(s)))
+  await until('goal turn', () => turnEnds(session) >= 1 ? true : undefined)
+  const results = () => probes().filter(p => p.session === session && p.type === 'tool/result').map(toolText)
+  log(`  webhook 消息引出的 create_goal → ${String(results()[0])}`)
+  writeFileSync(join(control, `human-${session}.tmp`), '建目标 修复payment-api')
+  renameSync(join(control, `human-${session}.tmp`), join(control, `human-${session}.txt`))
+  await until('human goal turn', () => results().length >= 2 ? true : undefined)
+  const created = JSON.parse(String(results()[1])) as { goal: { objective: string; phase: string }; activation: string }
+  log(`  同一会话里 user 来源的同一句 → 目标「${created.goal.objective}」${created.goal.phase}，activation ${created.activation}`)
+  assert.match(String(results()[0]), /requires a direct human turn/)
+  assert.equal(created.goal.phase, 'active')
 }
 
 log(`\ndsh 进程的终端输出里含 webhook 的行：${String(output.split('\n').filter(l => l.includes('webhook')).length)} 行`)
